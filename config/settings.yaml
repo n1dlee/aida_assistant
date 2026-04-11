@@ -1,0 +1,34 @@
+# AIDA Configuration
+# Edit this file to customize behaviour without touching Python code.
+
+aida:
+  name: "AIDA"
+  language: "auto"          # auto = detect from user input
+  wake_word: "hey aida"
+  log_level: "INFO"
+
+brain:
+  local_model: "gemma4:31b"        # Ollama model name
+  cloud_provider: "gemini"           # "gemini" or "openai"
+  cloud_model_gemini: "gemini-2.0-flash"
+  cloud_model_openai: "gpt-4o-mini"
+  cloud_threshold: 0.4               # 0.0 = always local, 1.0 = always cloud
+  ollama_url: "http://localhost:11434"
+
+voice:
+  enabled: true
+  whisper_model: "small"             # tiny | base | small | medium | large
+  tts_rate: 175                      # words per minute for pyttsx3
+  piper_voice: "en_US-lessac-medium"
+  record_seconds: 5
+
+memory:
+  buffer_turns: 20                   # short-term: last N conversation turns
+  vector_top_k: 3                    # how many memories to inject into context
+  chroma_path: "data/chroma_db"
+  episodes_path: "data/episodes.json"
+
+proactive:
+  enabled: true
+  daily_briefing_hour: 9
+  daily_briefing_minute: 0

@@ -1,0 +1,46 @@
+# AIDA — Python dependencies
+# Install: pip install -r requirements.txt
+
+# --- Core ---
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# --- LLM: Local ---
+ollama>=0.2.0
+
+# --- LLM: Cloud ---
+google-generativeai>=0.5.0
+openai>=1.30.0
+
+# --- Memory ---
+chromadb>=0.5.0
+
+# --- Voice: STT ---
+faster-whisper>=1.0.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+
+# --- Voice: TTS ---
+pyttsx3>=2.90
+
+# --- Voice: Wake word ---
+openwakeword>=0.6.0
+
+# --- Tools ---
+duckduckgo-search>=6.0.0
+
+# --- Proactive scheduler ---
+apscheduler>=3.10.0
+
+# --- Optional: numpy (required by voice modules) ---
+numpy>=1.24.0
+
+# --- Web server (for React UI) ---
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+
+# --- Gradio UI ---
+gradio>=4.40.0
+
+# --- ell (prompt versioning, optional) ---
+ell-ai>=0.0.15
