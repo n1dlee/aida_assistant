@@ -40,6 +40,15 @@ class LocalLLM:
 
             names = [n for n in names if n]
             if not names:
+                # Some ollama-python builds return model objects in a shape that is not
+                # fully stable across versions. If Ollama is reachable, treat local as
+                # available and let chat() surface the exact runtime error instead of
+                # incorrectly reporting "no model available".
+                log.warning(
+                    "Ollama reachable at %s, but model list could not be parsed.",
+                    self.base_url,
+                )
+                return True
                 log.warning("Ollama reachable, but no models reported at %s", self.base_url)
                 return False
 
