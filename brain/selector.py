@@ -91,5 +91,11 @@ class ModelSelector:
 
         if errors:
             log.error("All available providers failed: %s", errors)
+            first_provider, first_error = errors[0]
+            return (
+                f"{first_provider.capitalize()} model failed: {first_error}. "
+                "Try a smaller local model (e.g. 3b/7b), or enable a cloud API key.",
+                "none",
+            )
 
         return "Sorry, no AI model is currently available. Please check your config.", "none"
