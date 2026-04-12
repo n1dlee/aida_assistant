@@ -53,6 +53,17 @@ def core_markup(glow: bool = False) -> str:
     </div>
     """
 
+
+def core_markup(glow: bool = False) -> str:
+    active = " core-active" if glow else ""
+    return f"""
+    <div class=\"jarvis-core{active}\">
+      <div class=\"jarvis-core-ring\">
+        <div class=\"jarvis-core-dot\"></div>
+      </div>
+    </div>
+    """
+
 if ELL_AVAILABLE and ell is not None:
     ell.init(store="./data/ell_store", autocommit=True, verbose=False)
 
@@ -286,79 +297,6 @@ def save_settings(gemini_key: str, openai_key: str, mic_choice: str):
         get_status(),
         f"✅ Settings saved. Mic: {mic_choice or 'default'}",
     )
-
-
-def _wake_loop(mic_choice: str, duration: float, wake_word: str):
-    global WAKE_RUNNING
-    detector = WakeWordDetector(wake_word=wake_word)
-    WAKE_EVENTS.put(("status", f"Listening 24/7 for wake word: '{wake_word}'"))
-
-    if not detector.is_available():
-        WAKE_EVENTS.put(("status", "Wake word module unavailable (install openwakeword)."))
-        WAKE_RUNNING = False
-        return
-
-    while WAKE_RUNNING:
-        try:
-            triggered = detector._blocking_listen()
-            if not WAKE_RUNNING:
-                break
-            if not triggered:
-                continue
-
-            WAKE_EVENTS.put(("status", "Wake word detected. Capturing voice..."))
-            audio_path = record_from_mic(mic_choice, duration=max(2.0, float(duration)))
-            transcript = transcribe_audio(audio_path, mic_choice)
-            try:
-                os.remove(audio_path)
-            except OSError:
-                pass
-
-            if transcript.startswith("["):
-                WAKE_EVENTS.put(("status", f"STT failed: {transcript}"))
-                continue
-
-            response = asyncio.run(orchestrator.process(transcript))
-            WAKE_EVENTS.put(("message", transcript, response))
-            WAKE_EVENTS.put(("status", "Listening for wake word..."))
-        except Exception as e:
-            WAKE_EVENTS.put(("status", f"Wake loop error: {e}"))
-
-
-def start_wake_mode(mic_choice: str, duration: float, wake_word: str):
-    global WAKE_RUNNING, WAKE_THREAD
-    if WAKE_RUNNING:
-        return "Wake mode already running."
-    WAKE_RUNNING = True
-    WAKE_THREAD = threading.Thread(
-        target=_wake_loop,
-        args=(mic_choice, duration, (wake_word or "aida").strip().lower()),
-        daemon=True,
-    )
-    WAKE_THREAD.start()
-    return "Wake mode started."
-
-
-def stop_wake_mode():
-    global WAKE_RUNNING
-    WAKE_RUNNING = False
-    return "Wake mode stopped."
-
-
-def poll_wake_events(history: list):
-    status = "Listening..." if WAKE_RUNNING else "Idle"
-    transcript = ""
-    while not WAKE_EVENTS.empty():
-        event = WAKE_EVENTS.get()
-        if not event:
-            continue
-        if event[0] == "status":
-            status = event[1]
-        elif event[0] == "message":
-            user_text, bot_text = event[1], event[2]
-            history = history + [make_user_msg(f"🎤 {user_text}"), make_aida_msg(bot_text)]
-            transcript = user_text
-    return history, status, transcript
 
 
 # ─── Custom CSS ── 420×870 window, no page-level scroll ──────────────────────
@@ -703,39 +641,9 @@ with gr.Blocks(
 
     # ── Voice panel (hidden in Text mode) ────────────────────────────────────
     with gr.Group(visible=True, elem_classes=["aida-voice-panel"]) as voice_group:
-        voice_hint = gr.Markdown(
-            "Voice mode: choose mic → set duration → press **TALK** and speak immediately."
-        )
-        wake_word = gr.Textbox(
-            label="Wake word",
-            value="aida",
-            placeholder="aida",
-            lines=1,
-        )
-        with gr.Row(equal_height=True):
-            start_wake_btn = gr.Button("▶ Start 24/7 Wake Mode", variant="secondary", size="sm")
-            stop_wake_btn = gr.Button("■ Stop", variant="secondary", size="sm")
-        record_seconds = gr.Slider(
-            minimum=2,
-            maximum=12,
-            step=1,
-            value=5,
-            label="Record duration (seconds)",
-        )
-        with gr.Row(equal_height=True):
-            talk_btn = gr.Button("🎙 START VOICE CAPTURE", variant="secondary", size="sm")
-            mic_muted = gr.Checkbox(label="Mute mic", value=False)
-        voice_state = gr.Textbox(
-            label="Voice status",
-            value="Idle",
-            interactive=False,
-            lines=1,
-        )
-        last_transcript = gr.Textbox(
-            label="Last transcript",
-            value="",
-            interactive=False,
-            lines=2,
+        gr.Markdown(
+            "Voice mode is **output-only**: AIDA replies with voice (TTS). "
+            "Speech capture/wake-word is disabled for stability."
         )
 
     # ── Audio output (hidden element — autoplay only) ─────────────────────────
@@ -763,21 +671,6 @@ with gr.Blocks(
     text_in.submit(**submit_cfg)
     send_btn.click(**submit_cfg)
 
-    talk_btn.click(
-        fn=handle_voice_capture,
-        inputs=[chatbox, mode, mic_choice, mic_muted, record_seconds],
-        outputs=[chatbox, audio_out, voice_state, last_transcript, core_view],
-    )
-    start_wake_btn.click(
-        fn=start_wake_mode,
-        inputs=[mic_choice, record_seconds, wake_word],
-        outputs=[voice_state],
-    )
-    stop_wake_btn.click(
-        fn=stop_wake_mode,
-        outputs=[voice_state],
-    )
-
     clear_btn.click(fn=clear_chat, outputs=[chatbox, audio_out])
 
     mode.change(
@@ -792,12 +685,6 @@ with gr.Blocks(
         outputs=[status_md, settings_status],
     )
 
-    wake_timer = gr.Timer(value=1.0, active=True)
-    wake_timer.tick(
-        fn=poll_wake_events,
-        inputs=[chatbox],
-        outputs=[chatbox, voice_state, last_transcript],
-    )
 
 
 # ─── Launch ── native window (pywebview) or browser fallback ─────────────────
