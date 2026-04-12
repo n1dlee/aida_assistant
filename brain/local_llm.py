@@ -20,10 +20,47 @@ class LocalLLM:
     def is_available(self) -> bool:
         try:
             import ollama
-            # Quick ping
-            ollama.list()
+            client = ollama.Client(host=self.base_url)
+            models_resp = client.list()
+
+            # Some ollama versions return dict-like payloads,
+            # others return pydantic models with attributes.
+            models = []
+            if isinstance(models_resp, dict):
+                models = models_resp.get("models", []) or []
+            else:
+                models = getattr(models_resp, "models", []) or []
+
+            names = []
+            for model in models:
+                if isinstance(model, dict):
+                    names.append(model.get("name") or model.get("model"))
+                else:
+                    names.append(getattr(model, "name", None) or getattr(model, "model", None))
+
+            names = [n for n in names if n]
+            if not names:
+                # Some ollama-python builds return model objects in a shape that is not
+                # fully stable across versions. If Ollama is reachable, treat local as
+                # available and let chat() surface the exact runtime error instead of
+                # incorrectly reporting "no model available".
+                log.warning(
+                    "Ollama reachable at %s, but model list could not be parsed.",
+                    self.base_url,
+                )
+                return True
+
+            if self.model_name not in names:
+                log.warning(
+                    "Configured model '%s' is not available in Ollama. Available: %s",
+                    self.model_name,
+                    names,
+                )
+                return False
+
             return True
-        except Exception:
+        except Exception as e:
+            log.warning("Local Ollama is unavailable at %s: %s", self.base_url, e)
             return False
 
     def _get_client(self):
