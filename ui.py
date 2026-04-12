@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import threading
+from pathlib import Path
 
 # ── ell: must be initialised BEFORE it is used ──────────────────────────────
 # Assign None first so Pylance never sees it as "possibly unbound"
@@ -35,6 +36,17 @@ logging.basicConfig(
 log = logging.getLogger("aida.ui")
 
 orchestrator = Orchestrator()
+
+
+def core_markup(glow: bool = False) -> str:
+    active = " core-active" if glow else ""
+    return f"""
+    <div class=\"jarvis-core{active}\">
+      <div class=\"jarvis-core-ring\">
+        <div class=\"jarvis-core-dot\"></div>
+      </div>
+    </div>
+    """
 
 if ELL_AVAILABLE and ell is not None:
     ell.init(store="./data/ell_store", autocommit=True, verbose=False)
@@ -84,6 +96,65 @@ def transcribe_audio(audio_path: str, mic_index: str) -> str:
         return f"[STT error: {e}]"
 
 
+def record_from_mic(mic_choice: str, duration: float = 5.0) -> str:
+    """Record from selected input device and return temporary WAV path."""
+    import sounddevice as sd
+    import soundfile as sf
+
+    sample_rate = 16000
+    device_idx = None
+    if mic_choice and ":" in mic_choice:
+        try:
+            device_idx = int(mic_choice.split(":", 1)[0].strip())
+        except ValueError:
+            device_idx = None
+
+    log.info("Recording %.1fs from mic: %s", duration, mic_choice or "default")
+    audio = sd.rec(
+        int(duration * sample_rate),
+        samplerate=sample_rate,
+        channels=1,
+        dtype="float32",
+        device=device_idx,
+    )
+    sd.wait()
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
+        tmp = fh.name
+    sf.write(tmp, audio, sample_rate)
+    return tmp
+
+
+def handle_voice_capture(
+    history: list, mode: str, mic_choice: str, muted: bool, duration: float
+):
+    if mode != "Voice":
+        return history, None, "Voice mode is disabled.", "", core_markup(False)
+    if muted:
+        history = history + [make_aida_msg("🔇 Microphone muted. Unmute to speak.")]
+        return history, None, "Muted. Unmute microphone to record.", "", core_markup(False)
+
+    audio_path = None
+    try:
+        audio_path = record_from_mic(mic_choice, duration=max(2.0, float(duration)))
+        transcript = transcribe_audio(audio_path, mic_choice)
+        history = history + [make_user_msg(f"🎤 {transcript}")]
+        if transcript.startswith("["):
+            return history, None, "Speech-to-text failed.", transcript, core_markup(False)
+        response = _run_async(orchestrator.process(transcript))
+        history = history + [make_aida_msg(response)]
+        return history, speak_text(response), "✅ Voice captured and processed.", transcript, core_markup(True)
+    except Exception as e:
+        history = history + [make_aida_msg(f"[Voice capture error: {e}]")]
+        return history, None, f"Voice capture error: {e}", "", core_markup(False)
+    finally:
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+
+
 def speak_text(text: str) -> str | None:
     """TTS → WAV file path, or None if TTS unavailable."""
     try:
@@ -127,16 +198,16 @@ def make_aida_msg(text: str) -> dict:
 
 def handle_text(user_message: str, history: list, mode: str):
     if not user_message.strip():
-        yield history, "", None
+        yield history, "", None, core_markup(False)
         return
 
     history = history + [make_user_msg(user_message)]
-    yield history, "", None
+    yield history, "", None, core_markup(False)
 
     response  = _run_async(orchestrator.process(user_message))
     history   = history + [make_aida_msg(response)]
-    audio_out = speak_text(response) if mode in ("Voice", "Hybrid") else None
-    yield history, "", audio_out
+    audio_out = speak_text(response) if mode == "Voice" else None
+    yield history, "", audio_out, core_markup(True)
 
 
 def handle_voice(audio_path, history: list, mode: str, mic_choice: str):
@@ -157,8 +228,59 @@ def clear_chat():
 
 
 def toggle_voice_ui(m: str):
-    show = m in ("Voice", "Hybrid")
-    return gr.update(visible=show), gr.update(visible=show)
+    show = m == "Voice"
+    text_enabled = m != "Voice"
+    chat_h = 150 if show else 320
+    return (
+        gr.update(visible=show),
+        gr.update(visible=show),
+        gr.update(visible=text_enabled),
+        gr.update(height=chat_h, min_height=chat_h),
+    )
+
+
+def _set_env_value(env_path: Path, key: str, value: str):
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = []
+    if env_path.exists():
+        existing = env_path.read_text(encoding="utf-8").splitlines()
+
+    prefix = f"{key}="
+    replaced = False
+    out = []
+    for line in existing:
+        if line.startswith(prefix):
+            out.append(f"{prefix}{value}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"{prefix}{value}")
+
+    env_path.write_text("\n".join(out).strip() + "\n", encoding="utf-8")
+
+
+def save_settings(gemini_key: str, openai_key: str, mic_choice: str):
+    gemini_key = (gemini_key or "").strip()
+    openai_key = (openai_key or "").strip()
+
+    os.environ["GEMINI_API_KEY"] = gemini_key
+    os.environ["OPENAI_API_KEY"] = openai_key
+
+    orchestrator.selector.cloud.gemini_key = gemini_key
+    orchestrator.selector.cloud.openai_key = openai_key
+    orchestrator.selector.cloud.model_name = (
+        "gemini-2.0-flash" if gemini_key else "gpt-4o-mini"
+    )
+
+    env_path = Path(__file__).resolve().parent / ".env"
+    _set_env_value(env_path, "GEMINI_API_KEY", gemini_key)
+    _set_env_value(env_path, "OPENAI_API_KEY", openai_key)
+
+    return (
+        get_status(),
+        f"✅ Settings saved. Mic: {mic_choice or 'default'}",
+    )
 
 
 # ─── Custom CSS ── 420×870 window, no page-level scroll ──────────────────────
@@ -171,19 +293,20 @@ html, body {
     height: 100% !important;
     margin: 0;
     padding: 0;
-    background: #0a0c0f !important;
+    background: #120c0c !important;
     font-family: 'Inter', 'Segoe UI', sans-serif;
 }
 
 .gradio-container {
-    max-width: 420px !important;
-    width: 420px !important;
-    min-height: 870px !important;
-    max-height: 870px !important;
-    overflow: hidden !important;
-    background: #0a0c0f !important;
+    max-width: 430px !important;
+    width: 430px !important;
+    min-height: 900px !important;
+    max-height: 900px !important;
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    background: linear-gradient(180deg, #1a1010 0%, #0f0808 100%) !important;
     margin: 0 !important;
-    padding: 0 6px 0 6px !important;
+    padding: 0 10px !important;
     box-sizing: border-box;
 }
 
@@ -196,24 +319,57 @@ footer { display: none !important; }
     text-align: center;
     padding: 14px 0 4px;
     letter-spacing: 6px;
-    font-size: 1.35rem;
+    font-size: 1.45rem;
     font-weight: 800;
-    color: #00d4ff;
-    text-shadow: 0 0 18px #00d4ff88;
+    color: #c87a7a;
+    text-shadow: 0 0 18px #c87a7a55;
 }
 .aida-sub {
     text-align: center;
-    font-size: 0.55rem;
-    letter-spacing: 4px;
+    font-size: 0.6rem;
+    letter-spacing: 3px;
     color: #ffffff28;
     margin-bottom: 6px;
 }
 
+.jarvis-core {
+    display: flex;
+    justify-content: center;
+    margin: 8px 0 10px;
+}
+.jarvis-core-ring {
+    width: 160px;
+    height: 160px;
+    border-radius: 999px;
+    border: 1px solid #a44f4f6a;
+    background: radial-gradient(circle, #8f3a3a35 0%, #1a0d0d00 72%);
+    box-shadow: inset 0 0 24px #8f3a3a2b, 0 0 26px #00000055;
+    position: relative;
+}
+.jarvis-core-ring::before {
+    content: "";
+    position: absolute;
+    inset: 18px;
+    border-radius: 999px;
+    border: 1px dashed #b35a5a3d;
+}
+.jarvis-core-dot {
+    position: absolute;
+    inset: 58px;
+    border-radius: 999px;
+    background: radial-gradient(circle, #ffdede 0%, #d37474 52%, #d3747400 100%);
+}
+.core-active .jarvis-core-ring {
+    box-shadow: inset 0 0 34px #c24d4d5f, 0 0 34px #c24d4d57;
+}
+.core-active .jarvis-core-dot {
+    box-shadow: 0 0 22px #ff8f8f99;
+}
 /* ── Status bar ─────────────────────────────────────────── */
 .aida-status p {
     text-align: center;
     font-size: 0.65rem;
-    color: #00d4ff88;
+    color: #c87a7a75;
     letter-spacing: 1px;
     margin: 0 !important;
     padding: 2px 0 4px !important;
@@ -221,25 +377,27 @@ footer { display: none !important; }
 
 /* ── Chatbot ─────────────────────────────────────────────── */
 .aida-chat {
-    background: transparent !important;
-    border: 1px solid #ffffff0f !important;
-    border-radius: 10px !important;
+    background: #1a171acc !important;
+    border: 1px solid #ffffff1e !important;
+    border-radius: 18px !important;
+    backdrop-filter: blur(10px);
+    box-shadow: inset 0 1px 0 #ffffff14, 0 8px 20px #00000038;
 }
 .aida-chat .message-bubble-border {
     border-radius: 8px !important;
 }
 /* user bubble */
 .aida-chat [data-testid="user"] .bubble-wrap {
-    background: #00d4ff18 !important;
-    border: 1px solid #00d4ff30 !important;
-    color: #d0f4ff !important;
+    background: #c06c6c1f !important;
+    border: 1px solid #c06c6c44 !important;
+    color: #f5dbdb !important;
     font-size: 0.82rem !important;
 }
 /* assistant bubble */
 .aida-chat [data-testid="bot"] .bubble-wrap {
-    background: #1a1e26 !important;
-    border: 1px solid #ffffff12 !important;
-    color: #c8cdd8 !important;
+    background: #131a17 !important;
+    border: 1px solid #ffffff14 !important;
+    color: #d5dbd8 !important;
     font-size: 0.82rem !important;
 }
 
@@ -254,57 +412,80 @@ footer { display: none !important; }
     color: #8892a4 !important;
 }
 .aida-mode label.selected span {
-    color: #00d4ff !important;
+    color: #c87a7a !important;
 }
 .aida-mode label {
-    border: 1px solid #ffffff14 !important;
-    border-radius: 6px !important;
-    background: transparent !important;
+    border: 1px solid #c87a7a26 !important;
+    border-radius: 8px !important;
+    background: #0f171400 !important;
     padding: 3px 12px !important;
 }
 .aida-mode label.selected {
-    border-color: #00d4ff44 !important;
-    background: #00d4ff0e !important;
+    border-color: #c87a7a66 !important;
+    background: #c87a7a1a !important;
 }
 
 /* ── Input row ──────────────────────────────────────────── */
 .aida-input textarea {
-    background: #111318 !important;
-    border: 1px solid #ffffff14 !important;
-    border-radius: 8px !important;
-    color: #d0d8e8 !important;
+    background: #181315 !important;
+    border: 1px solid #c87a7a26 !important;
+    border-radius: 10px !important;
+    color: #e4d4d4 !important;
     font-size: 0.82rem !important;
     resize: none !important;
 }
 .aida-input textarea:focus {
-    border-color: #00d4ff44 !important;
-    box-shadow: 0 0 0 2px #00d4ff14 !important;
+    border-color: #c87a7a55 !important;
+    box-shadow: 0 0 0 2px #c87a7a1f !important;
 }
 .aida-send button {
-    background: #00d4ff18 !important;
-    border: 1px solid #00d4ff44 !important;
-    border-radius: 8px !important;
-    color: #00d4ff !important;
+    background: #2a1f22 !important;
+    border: 1px solid #c87a7a44 !important;
+    border-radius: 10px !important;
+    color: #f1c9c9 !important;
     font-size: 0.75rem !important;
     letter-spacing: 1px;
     height: 42px !important;
 }
 .aida-send button:hover {
-    background: #00d4ff28 !important;
+    background: #3a2a2e !important;
 }
 
 /* ── Voice panel ────────────────────────────────────────── */
 .aida-voice-panel {
-    border: 1px solid #ffffff0a !important;
-    border-radius: 8px !important;
+    border: 1px solid #c87a7a25 !important;
+    border-radius: 10px !important;
     padding: 6px 8px !important;
-    background: #0e1117 !important;
+    background: #151012 !important;
 }
-.aida-voice-panel select, .aida-voice-panel .wrap-inner {
-    background: #111318 !important;
-    border: 1px solid #ffffff14 !important;
-    color: #8892a4 !important;
+.aida-voice-panel select, .aida-voice-panel .wrap-inner,
+.aida-settings input, .aida-settings select {
+    background: #1b1416 !important;
+    border: 1px solid #c87a7a26 !important;
+    color: #d9b7b7 !important;
     font-size: 0.72rem !important;
+    border-radius: 8px !important;
+}
+
+.aida-settings {
+    border: 1px solid #c87a7a25 !important;
+    border-radius: 10px !important;
+    background: #151012 !important;
+    box-shadow: inset 0 0 0 1px #c87a7a1a;
+}
+.aida-settings button {
+    border-radius: 8px !important;
+}
+.aida-settings-status textarea {
+    color: #c87a7a !important;
+}
+.aida-voice-panel button {
+    background: #2a1f22 !important;
+    border: 1px solid #c87a7a44 !important;
+    color: #f1c9c9 !important;
+}
+.aida-voice-panel button:hover {
+    background: #3a2a2e !important;
 }
 
 /* ── Clear button ───────────────────────────────────────── */
@@ -342,8 +523,8 @@ MIC_LIST = get_microphones()
 #  - voice panel:  ~100px (visible by default for Hybrid)
 #  - clear btn:    ~30px
 #  - gaps/padding: ~36px
-#  = 340px used → chat gets 870 - 340 = 530px
-CHAT_HEIGHT = 530
+#  = dynamic, so controls at bottom stay visible even in Voice/Hybrid.
+CHAT_HEIGHT = 260
 
 with gr.Blocks(
     title="AIDA",
@@ -355,20 +536,51 @@ with gr.Blocks(
     # ── Header ──────────────────────────────────────────────────────────────
     gr.HTML("""
     <div class="aida-header">◈ AIDA</div>
-    <div class="aida-sub">AI DESKTOP ASSISTANT</div>
+    <div class="aida-sub">MINIMAL VOICE ASSISTANT</div>
     """)
 
     # ── Status ───────────────────────────────────────────────────────────────
-    gr.Markdown(get_status, elem_classes=["aida-status", "hide-label"])
+    status_md = gr.Markdown(get_status(), elem_classes=["aida-status", "hide-label"])
 
     # ── Mode ─────────────────────────────────────────────────────────────────
     mode = gr.Radio(
-        choices=["Text", "Voice", "Hybrid"],
-        value="Hybrid",
+        choices=["Text", "Voice"],
+        value="Voice",
         show_label=False,
         container=False,
         elem_classes=["aida-mode"],
     )
+
+    core_view = gr.HTML(core_markup(False))
+
+    # ── Settings ─────────────────────────────────────────────────────────────
+    with gr.Accordion("⚙ Settings", open=False, elem_classes=["aida-settings"]):
+        gemini_key = gr.Textbox(
+            label="Gemini API Key",
+            type="password",
+            value=os.getenv("GEMINI_API_KEY", ""),
+            placeholder="AIza...",
+        )
+        openai_key = gr.Textbox(
+            label="OpenAI API Key",
+            type="password",
+            value=os.getenv("OPENAI_API_KEY", ""),
+            placeholder="sk-...",
+        )
+        mic_choice = gr.Dropdown(
+            choices=MIC_LIST,
+            value=MIC_LIST[0] if MIC_LIST else None,
+            label="Microphone",
+            interactive=True,
+        )
+        save_settings_btn = gr.Button("Save settings", variant="secondary", size="sm")
+        settings_status = gr.Textbox(
+            label="",
+            value="",
+            interactive=False,
+            lines=1,
+            elem_classes=["aida-settings-status"],
+        )
 
     # ── Chat ─────────────────────────────────────────────────────────────────
     chatbox = gr.Chatbot(
@@ -383,7 +595,7 @@ with gr.Blocks(
     )
 
     # ── Input ────────────────────────────────────────────────────────────────
-    with gr.Row(equal_height=True):
+    with gr.Row(equal_height=True) as text_row:
         text_in = gr.Textbox(
             placeholder="Message AIDA...",
             show_label=False,
@@ -403,18 +615,9 @@ with gr.Blocks(
 
     # ── Voice panel (hidden in Text mode) ────────────────────────────────────
     with gr.Group(visible=True, elem_classes=["aida-voice-panel"]) as voice_group:
-        mic_choice = gr.Dropdown(
-            choices=MIC_LIST,
-            value=MIC_LIST[0] if MIC_LIST else None,
-            show_label=False,
-            container=False,
-            interactive=True,
-        )
-        mic_in = gr.Audio(
-            sources=["microphone"],
-            type="filepath",
-            show_label=False,
-            container=False,
+        gr.Markdown(
+            "Voice mode is **output-only**: AIDA replies with voice (TTS). "
+            "Speech capture/wake-word is disabled for stability."
         )
 
     # ── Audio output (hidden element — autoplay only) ─────────────────────────
@@ -437,24 +640,25 @@ with gr.Blocks(
     submit_cfg = dict(
         fn=handle_text,
         inputs=[text_in, chatbox, mode],
-        outputs=[chatbox, text_in, audio_out],
+        outputs=[chatbox, text_in, audio_out, core_view],
     )
     text_in.submit(**submit_cfg)
     send_btn.click(**submit_cfg)
-
-    mic_in.stop_recording(
-        fn=handle_voice,
-        inputs=[mic_in, chatbox, mode, mic_choice],
-        outputs=[chatbox, audio_out],
-    )
 
     clear_btn.click(fn=clear_chat, outputs=[chatbox, audio_out])
 
     mode.change(
         fn=toggle_voice_ui,
         inputs=mode,
-        outputs=[voice_group, audio_out],
+        outputs=[voice_group, audio_out, text_row, chatbox],
     )
+
+    save_settings_btn.click(
+        fn=save_settings,
+        inputs=[gemini_key, openai_key, mic_choice],
+        outputs=[status_md, settings_status],
+    )
+
 
 
 # ─── Launch ── native window (pywebview) or browser fallback ─────────────────
@@ -486,14 +690,14 @@ if __name__ == "__main__":
         import time
         time.sleep(2)   # wait for Gradio to bind
 
-        log.info("Opening native window (420×870)...")
+        log.info("Opening native window (430×900)...")
         webview.create_window(
             title="AIDA",
             url=f"http://127.0.0.1:{PORT}",
-            width=420,
-            height=870,
+            width=430,
+            height=900,
             resizable=False,        # fixed size — layout is tuned for this
-            min_size=(420, 870),
+            min_size=(430, 900),
             frameless=False,
             on_top=False,
             background_color="#0a0c0f",
