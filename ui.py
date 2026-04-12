@@ -217,10 +217,12 @@ def clear_chat():
 def toggle_voice_ui(m: str):
     show = m in ("Voice", "Hybrid")
     text_enabled = m != "Voice"
+    chat_h = 430 if show else 520
     return (
         gr.update(visible=show),
         gr.update(visible=show),
         gr.update(visible=text_enabled),
+        gr.update(height=chat_h, min_height=chat_h),
     )
 
 
@@ -287,11 +289,26 @@ html, body {
     width: 420px !important;
     min-height: 870px !important;
     max-height: 870px !important;
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    background:
+      radial-gradient(circle at 50% -10%, #264436 0%, transparent 42%),
+      linear-gradient(180deg, #0e1814 0%, #090f0d 100%) !important;
     overflow: hidden !important;
     background: radial-gradient(circle at top, #15241f 0%, #0b1210 55%, #090f0d 100%) !important;
     margin: 0 !important;
     padding: 0 6px 0 6px !important;
     box-sizing: border-box;
+}
+.gradio-container::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image: linear-gradient(#9bd9b208 1px, transparent 1px),
+                      linear-gradient(90deg, #9bd9b208 1px, transparent 1px);
+    background-size: 28px 28px;
+    mask-image: radial-gradient(circle at center, black 40%, transparent 95%);
 }
 
 /* Hide Gradio footer */
@@ -306,7 +323,7 @@ footer { display: none !important; }
     font-size: 1.35rem;
     font-weight: 800;
     color: #9bd9b2;
-    text-shadow: 0 0 16px #9bd9b244;
+    text-shadow: 0 0 18px #9bd9b255;
 }
 .aida-sub {
     text-align: center;
@@ -331,7 +348,8 @@ footer { display: none !important; }
     background: transparent !important;
     border: 1px solid #9bd9b222 !important;
     border-radius: 14px !important;
-    backdrop-filter: blur(4px);
+    backdrop-filter: blur(6px);
+    box-shadow: inset 0 0 0 1px #9bd9b20e, 0 12px 30px #0000003f;
 }
 .aida-chat .message-bubble-border {
     border-radius: 8px !important;
@@ -365,9 +383,9 @@ footer { display: none !important; }
     color: #9bd9b2 !important;
 }
 .aida-mode label {
-    border: 1px solid #ffffff14 !important;
-    border-radius: 6px !important;
-    background: transparent !important;
+    border: 1px solid #9bd9b226 !important;
+    border-radius: 8px !important;
+    background: #0f171400 !important;
     padding: 3px 12px !important;
 }
 .aida-mode label.selected {
@@ -464,8 +482,8 @@ MIC_LIST = get_microphones()
 #  - voice panel:  ~100px (visible by default for Hybrid)
 #  - clear btn:    ~30px
 #  - gaps/padding: ~36px
-#  = 340px used → chat gets 870 - 340 = 530px
-CHAT_HEIGHT = 530
+#  = dynamic, so controls at bottom stay visible even in Voice/Hybrid.
+CHAT_HEIGHT = 430
 
 with gr.Blocks(
     title="AIDA",
@@ -595,6 +613,7 @@ with gr.Blocks(
     mode.change(
         fn=toggle_voice_ui,
         inputs=mode,
+        outputs=[voice_group, audio_out, text_row, chatbox],
         outputs=[voice_group, audio_out, text_row],
     )
 
