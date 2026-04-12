@@ -114,26 +114,28 @@ def record_from_mic(mic_choice: str, duration: float = 5.0) -> str:
     return tmp
 
 
-def handle_voice_capture(history: list, mode: str, mic_choice: str, muted: bool):
+def handle_voice_capture(
+    history: list, mode: str, mic_choice: str, muted: bool, duration: float
+):
     if mode not in ("Voice", "Hybrid"):
-        return history, None
+        return history, None, "Voice mode is disabled.", ""
     if muted:
         history = history + [make_aida_msg("🔇 Microphone muted. Unmute to speak.")]
-        return history, None
+        return history, None, "Muted. Unmute microphone to record.", ""
 
     audio_path = None
     try:
-        audio_path = record_from_mic(mic_choice, duration=5.0)
+        audio_path = record_from_mic(mic_choice, duration=max(2.0, float(duration)))
         transcript = transcribe_audio(audio_path, mic_choice)
         history = history + [make_user_msg(f"🎤 {transcript}")]
         if transcript.startswith("["):
-            return history, None
+            return history, None, "Speech-to-text failed.", transcript
         response = _run_async(orchestrator.process(transcript))
         history = history + [make_aida_msg(response)]
-        return history, speak_text(response)
+        return history, speak_text(response), "✅ Voice captured and processed.", transcript
     except Exception as e:
         history = history + [make_aida_msg(f"[Voice capture error: {e}]")]
-        return history, None
+        return history, None, f"Voice capture error: {e}", ""
     finally:
         if audio_path and os.path.exists(audio_path):
             try:
@@ -217,7 +219,7 @@ def clear_chat():
 def toggle_voice_ui(m: str):
     show = m in ("Voice", "Hybrid")
     text_enabled = m != "Voice"
-    chat_h = 430 if show else 520
+    chat_h = 520 if show else 640
     return (
         gr.update(visible=show),
         gr.update(visible=show),
@@ -285,17 +287,15 @@ html, body {
 }
 
 .gradio-container {
-    max-width: 420px !important;
-    width: 420px !important;
-    min-height: 870px !important;
-    max-height: 870px !important;
+    max-width: 830px !important;
+    width: 830px !important;
+    min-height: 1100px !important;
+    max-height: 1100px !important;
     overflow-x: hidden !important;
     overflow-y: auto !important;
     background:
       radial-gradient(circle at 50% -10%, #264436 0%, transparent 42%),
       linear-gradient(180deg, #0e1814 0%, #090f0d 100%) !important;
-    overflow: hidden !important;
-    background: radial-gradient(circle at top, #15241f 0%, #0b1210 55%, #090f0d 100%) !important;
     margin: 0 !important;
     padding: 0 6px 0 6px !important;
     box-sizing: border-box;
@@ -320,17 +320,61 @@ footer { display: none !important; }
     text-align: center;
     padding: 14px 0 4px;
     letter-spacing: 6px;
-    font-size: 1.35rem;
+    font-size: 2rem;
     font-weight: 800;
     color: #9bd9b2;
     text-shadow: 0 0 18px #9bd9b255;
 }
 .aida-sub {
     text-align: center;
-    font-size: 0.55rem;
+    font-size: 0.72rem;
     letter-spacing: 4px;
     color: #ffffff28;
     margin-bottom: 6px;
+}
+
+.jarvis-core {
+    width: 100%;
+    display: flex;
+    justify-content: center;
+    margin: 8px 0 12px;
+}
+.jarvis-ring {
+    width: 250px;
+    height: 250px;
+    border-radius: 999px;
+    position: relative;
+    border: 2px solid #72cfc66b;
+    box-shadow: 0 0 40px #2ecbc642, inset 0 0 40px #2ecbc620;
+    background: radial-gradient(circle, #7bc4be38 0%, #0f171400 68%);
+    animation: pulse 2.6s ease-in-out infinite;
+}
+.jarvis-ring::before, .jarvis-ring::after {
+    content: "";
+    position: absolute;
+    inset: 18px;
+    border-radius: 999px;
+    border: 2px dashed #72cfc647;
+    animation: spin 12s linear infinite;
+}
+.jarvis-ring::after {
+    inset: 42px;
+    border-style: solid;
+    border-color: #9bd9b250;
+    animation-direction: reverse;
+    animation-duration: 8s;
+}
+.jarvis-center {
+    position: absolute;
+    inset: 84px;
+    border-radius: 999px;
+    background: radial-gradient(circle, #d7fff6 0%, #84ece0 45%, #4acdc045 100%);
+    box-shadow: 0 0 30px #97f5ec80;
+}
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+@keyframes pulse {
+  0%, 100% { transform: scale(1); filter: drop-shadow(0 0 0 #00fff000); }
+  50% { transform: scale(1.03); filter: drop-shadow(0 0 12px #52e6d888); }
 }
 
 /* ── Status bar ─────────────────────────────────────────── */
@@ -439,12 +483,21 @@ footer { display: none !important; }
     border: 1px solid #9bd9b220 !important;
     border-radius: 10px !important;
     background: #0f1714 !important;
+    box-shadow: inset 0 0 0 1px #9bd9b21a;
 }
 .aida-settings button {
     border-radius: 8px !important;
 }
 .aida-settings-status textarea {
     color: #9bd9b2 !important;
+}
+.aida-voice-panel button {
+    background: #1d3027 !important;
+    border: 1px solid #9bd9b244 !important;
+    color: #ccead8 !important;
+}
+.aida-voice-panel button:hover {
+    background: #264136 !important;
 }
 
 /* ── Clear button ───────────────────────────────────────── */
@@ -483,7 +536,7 @@ MIC_LIST = get_microphones()
 #  - clear btn:    ~30px
 #  - gaps/padding: ~36px
 #  = dynamic, so controls at bottom stay visible even in Voice/Hybrid.
-CHAT_HEIGHT = 430
+CHAT_HEIGHT = 500
 
 with gr.Blocks(
     title="AIDA",
@@ -495,7 +548,7 @@ with gr.Blocks(
     # ── Header ──────────────────────────────────────────────────────────────
     gr.HTML("""
     <div class="aida-header">◈ AIDA</div>
-    <div class="aida-sub">AI DESKTOP ASSISTANT</div>
+    <div class="aida-sub">VOICE-READY FUTURISTIC ASSISTANT</div>
     """)
 
     # ── Status ───────────────────────────────────────────────────────────────
@@ -509,6 +562,14 @@ with gr.Blocks(
         container=False,
         elem_classes=["aida-mode"],
     )
+
+    gr.HTML("""
+    <div class="jarvis-core">
+      <div class="jarvis-ring">
+        <div class="jarvis-center"></div>
+      </div>
+    </div>
+    """)
 
     # ── Settings ─────────────────────────────────────────────────────────────
     with gr.Accordion("⚙ Settings", open=False, elem_classes=["aida-settings"]):
@@ -572,10 +633,31 @@ with gr.Blocks(
 
     # ── Voice panel (hidden in Text mode) ────────────────────────────────────
     with gr.Group(visible=True, elem_classes=["aida-voice-panel"]) as voice_group:
-        gr.Markdown("Voice mode: press **TALK (5s)**, or mute mic.")
+        voice_hint = gr.Markdown(
+            "Voice mode: choose mic → set duration → press **TALK** and speak immediately."
+        )
+        record_seconds = gr.Slider(
+            minimum=2,
+            maximum=12,
+            step=1,
+            value=5,
+            label="Record duration (seconds)",
+        )
         with gr.Row(equal_height=True):
-            talk_btn = gr.Button("🎙 TALK (5s)", variant="secondary", size="sm")
+            talk_btn = gr.Button("🎙 START VOICE CAPTURE", variant="secondary", size="sm")
             mic_muted = gr.Checkbox(label="Mute mic", value=False)
+        voice_state = gr.Textbox(
+            label="Voice status",
+            value="Idle",
+            interactive=False,
+            lines=1,
+        )
+        last_transcript = gr.Textbox(
+            label="Last transcript",
+            value="",
+            interactive=False,
+            lines=2,
+        )
 
     # ── Audio output (hidden element — autoplay only) ─────────────────────────
     audio_out = gr.Audio(
@@ -604,8 +686,8 @@ with gr.Blocks(
 
     talk_btn.click(
         fn=handle_voice_capture,
-        inputs=[chatbox, mode, mic_choice, mic_muted],
-        outputs=[chatbox, audio_out],
+        inputs=[chatbox, mode, mic_choice, mic_muted, record_seconds],
+        outputs=[chatbox, audio_out, voice_state, last_transcript],
     )
 
     clear_btn.click(fn=clear_chat, outputs=[chatbox, audio_out])
@@ -614,7 +696,6 @@ with gr.Blocks(
         fn=toggle_voice_ui,
         inputs=mode,
         outputs=[voice_group, audio_out, text_row, chatbox],
-        outputs=[voice_group, audio_out, text_row],
     )
 
     save_settings_btn.click(
@@ -653,14 +734,14 @@ if __name__ == "__main__":
         import time
         time.sleep(2)   # wait for Gradio to bind
 
-        log.info("Opening native window (420×870)...")
+        log.info("Opening native window (830×1100)...")
         webview.create_window(
             title="AIDA",
             url=f"http://127.0.0.1:{PORT}",
-            width=420,
-            height=870,
+            width=830,
+            height=1100,
             resizable=False,        # fixed size — layout is tuned for this
-            min_size=(420, 870),
+            min_size=(830, 1100),
             frameless=False,
             on_top=False,
             background_color="#0a0c0f",
