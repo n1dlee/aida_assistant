@@ -8,6 +8,7 @@ ui.py — AIDA Desktop App
 import asyncio
 import logging
 import os
+import queue
 import sys
 import tempfile
 import threading
@@ -28,6 +29,7 @@ import gradio as gr
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.orchestrator import Orchestrator
+from voice.wake_word import WakeWordDetector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +38,20 @@ logging.basicConfig(
 log = logging.getLogger("aida.ui")
 
 orchestrator = Orchestrator()
+WAKE_EVENTS: "queue.Queue[tuple]" = queue.Queue()
+WAKE_RUNNING = False
+WAKE_THREAD: threading.Thread | None = None
+
+
+def core_markup(glow: bool = False) -> str:
+    active = " core-active" if glow else ""
+    return f"""
+    <div class=\"jarvis-core{active}\">
+      <div class=\"jarvis-core-ring\">
+        <div class=\"jarvis-core-dot\"></div>
+      </div>
+    </div>
+    """
 
 
 def core_markup(glow: bool = False) -> str:
@@ -308,6 +324,16 @@ html, body {
     margin: 0 !important;
     padding: 0 10px !important;
     box-sizing: border-box;
+}
+.gradio-container::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image: linear-gradient(#9bd9b208 1px, transparent 1px),
+                      linear-gradient(90deg, #9bd9b208 1px, transparent 1px);
+    background-size: 28px 28px;
+    mask-image: radial-gradient(circle at center, black 40%, transparent 95%);
 }
 
 /* Hide Gradio footer */
