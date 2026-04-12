@@ -42,6 +42,17 @@ WAKE_EVENTS: "queue.Queue[tuple]" = queue.Queue()
 WAKE_RUNNING = False
 WAKE_THREAD: threading.Thread | None = None
 
+
+def core_markup(glow: bool = False) -> str:
+    active = " core-active" if glow else ""
+    return f"""
+    <div class=\"jarvis-core{active}\">
+      <div class=\"jarvis-core-ring\">
+        <div class=\"jarvis-core-dot\"></div>
+      </div>
+    </div>
+    """
+
 if ELL_AVAILABLE and ell is not None:
     ell.init(store="./data/ell_store", autocommit=True, verbose=False)
 
@@ -122,11 +133,11 @@ def record_from_mic(mic_choice: str, duration: float = 5.0) -> str:
 def handle_voice_capture(
     history: list, mode: str, mic_choice: str, muted: bool, duration: float
 ):
-    if mode not in ("Voice", "Hybrid"):
-        return history, None, "Voice mode is disabled.", ""
+    if mode != "Voice":
+        return history, None, "Voice mode is disabled.", "", core_markup(False)
     if muted:
         history = history + [make_aida_msg("🔇 Microphone muted. Unmute to speak.")]
-        return history, None, "Muted. Unmute microphone to record.", ""
+        return history, None, "Muted. Unmute microphone to record.", "", core_markup(False)
 
     audio_path = None
     try:
@@ -134,13 +145,13 @@ def handle_voice_capture(
         transcript = transcribe_audio(audio_path, mic_choice)
         history = history + [make_user_msg(f"🎤 {transcript}")]
         if transcript.startswith("["):
-            return history, None, "Speech-to-text failed.", transcript
+            return history, None, "Speech-to-text failed.", transcript, core_markup(False)
         response = _run_async(orchestrator.process(transcript))
         history = history + [make_aida_msg(response)]
-        return history, speak_text(response), "✅ Voice captured and processed.", transcript
+        return history, speak_text(response), "✅ Voice captured and processed.", transcript, core_markup(True)
     except Exception as e:
         history = history + [make_aida_msg(f"[Voice capture error: {e}]")]
-        return history, None, f"Voice capture error: {e}", ""
+        return history, None, f"Voice capture error: {e}", "", core_markup(False)
     finally:
         if audio_path and os.path.exists(audio_path):
             try:
@@ -192,16 +203,16 @@ def make_aida_msg(text: str) -> dict:
 
 def handle_text(user_message: str, history: list, mode: str):
     if not user_message.strip():
-        yield history, "", None
+        yield history, "", None, core_markup(False)
         return
 
     history = history + [make_user_msg(user_message)]
-    yield history, "", None
+    yield history, "", None, core_markup(False)
 
     response  = _run_async(orchestrator.process(user_message))
     history   = history + [make_aida_msg(response)]
-    audio_out = speak_text(response) if mode in ("Voice", "Hybrid") else None
-    yield history, "", audio_out
+    audio_out = speak_text(response) if mode == "Voice" else None
+    yield history, "", audio_out, core_markup(True)
 
 
 def handle_voice(audio_path, history: list, mode: str, mic_choice: str):
@@ -222,9 +233,9 @@ def clear_chat():
 
 
 def toggle_voice_ui(m: str):
-    show = m in ("Voice", "Hybrid")
+    show = m == "Voice"
     text_enabled = m != "Voice"
-    chat_h = 260 if show else 320
+    chat_h = 150 if show else 320
     return (
         gr.update(visible=show),
         gr.update(visible=show),
@@ -360,7 +371,7 @@ html, body {
     height: 100% !important;
     margin: 0;
     padding: 0;
-    background: #0b1210 !important;
+    background: #120c0c !important;
     font-family: 'Inter', 'Segoe UI', sans-serif;
 }
 
@@ -369,8 +380,9 @@ html, body {
     width: 430px !important;
     min-height: 900px !important;
     max-height: 900px !important;
-    overflow: hidden !important;
-    background: linear-gradient(180deg, #0f1412 0%, #0a0f0d 100%) !important;
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    background: linear-gradient(180deg, #1a1010 0%, #0f0808 100%) !important;
     margin: 0 !important;
     padding: 0 10px !important;
     box-sizing: border-box;
@@ -397,8 +409,8 @@ footer { display: none !important; }
     letter-spacing: 6px;
     font-size: 1.45rem;
     font-weight: 800;
-    color: #9bd9b2;
-    text-shadow: 0 0 18px #9bd9b255;
+    color: #c87a7a;
+    text-shadow: 0 0 18px #c87a7a55;
 }
 .aida-sub {
     text-align: center;
@@ -417,9 +429,9 @@ footer { display: none !important; }
     width: 160px;
     height: 160px;
     border-radius: 999px;
-    border: 1px solid #9bd9b24a;
-    background: radial-gradient(circle, #9bd9b235 0%, #0f171400 72%);
-    box-shadow: inset 0 0 24px #9bd9b22b, 0 0 26px #00000055;
+    border: 1px solid #a44f4f6a;
+    background: radial-gradient(circle, #8f3a3a35 0%, #1a0d0d00 72%);
+    box-shadow: inset 0 0 24px #8f3a3a2b, 0 0 26px #00000055;
     position: relative;
 }
 .jarvis-core-ring::before {
@@ -427,19 +439,25 @@ footer { display: none !important; }
     position: absolute;
     inset: 18px;
     border-radius: 999px;
-    border: 1px dashed #9bd9b23d;
+    border: 1px dashed #b35a5a3d;
 }
 .jarvis-core-dot {
     position: absolute;
     inset: 58px;
     border-radius: 999px;
-    background: radial-gradient(circle, #e8fffa 0%, #96ddd3 52%, #96ddd300 100%);
+    background: radial-gradient(circle, #ffdede 0%, #d37474 52%, #d3747400 100%);
+}
+.core-active .jarvis-core-ring {
+    box-shadow: inset 0 0 34px #c24d4d5f, 0 0 34px #c24d4d57;
+}
+.core-active .jarvis-core-dot {
+    box-shadow: 0 0 22px #ff8f8f99;
 }
 /* ── Status bar ─────────────────────────────────────────── */
 .aida-status p {
     text-align: center;
     font-size: 0.65rem;
-    color: #9bd9b275;
+    color: #c87a7a75;
     letter-spacing: 1px;
     margin: 0 !important;
     padding: 2px 0 4px !important;
@@ -447,7 +465,7 @@ footer { display: none !important; }
 
 /* ── Chatbot ─────────────────────────────────────────────── */
 .aida-chat {
-    background: #141917cc !important;
+    background: #1a171acc !important;
     border: 1px solid #ffffff1e !important;
     border-radius: 18px !important;
     backdrop-filter: blur(10px);
@@ -458,9 +476,9 @@ footer { display: none !important; }
 }
 /* user bubble */
 .aida-chat [data-testid="user"] .bubble-wrap {
-    background: #9bd9b21a !important;
-    border: 1px solid #9bd9b244 !important;
-    color: #d7efe2 !important;
+    background: #c06c6c1f !important;
+    border: 1px solid #c06c6c44 !important;
+    color: #f5dbdb !important;
     font-size: 0.82rem !important;
 }
 /* assistant bubble */
@@ -482,80 +500,80 @@ footer { display: none !important; }
     color: #8892a4 !important;
 }
 .aida-mode label.selected span {
-    color: #9bd9b2 !important;
+    color: #c87a7a !important;
 }
 .aida-mode label {
-    border: 1px solid #9bd9b226 !important;
+    border: 1px solid #c87a7a26 !important;
     border-radius: 8px !important;
     background: #0f171400 !important;
     padding: 3px 12px !important;
 }
 .aida-mode label.selected {
-    border-color: #9bd9b255 !important;
-    background: #9bd9b214 !important;
+    border-color: #c87a7a66 !important;
+    background: #c87a7a1a !important;
 }
 
 /* ── Input row ──────────────────────────────────────────── */
 .aida-input textarea {
-    background: #111a16 !important;
-    border: 1px solid #9bd9b226 !important;
+    background: #181315 !important;
+    border: 1px solid #c87a7a26 !important;
     border-radius: 10px !important;
-    color: #d6e2dc !important;
+    color: #e4d4d4 !important;
     font-size: 0.82rem !important;
     resize: none !important;
 }
 .aida-input textarea:focus {
-    border-color: #9bd9b255 !important;
-    box-shadow: 0 0 0 2px #9bd9b218 !important;
+    border-color: #c87a7a55 !important;
+    box-shadow: 0 0 0 2px #c87a7a1f !important;
 }
 .aida-send button {
-    background: #1a2d24 !important;
-    border: 1px solid #9bd9b244 !important;
+    background: #2a1f22 !important;
+    border: 1px solid #c87a7a44 !important;
     border-radius: 10px !important;
-    color: #b9e3ca !important;
+    color: #f1c9c9 !important;
     font-size: 0.75rem !important;
     letter-spacing: 1px;
     height: 42px !important;
 }
 .aida-send button:hover {
-    background: #20372c !important;
+    background: #3a2a2e !important;
 }
 
 /* ── Voice panel ────────────────────────────────────────── */
 .aida-voice-panel {
-    border: 1px solid #9bd9b220 !important;
+    border: 1px solid #c87a7a25 !important;
     border-radius: 10px !important;
     padding: 6px 8px !important;
-    background: #0f1714 !important;
+    background: #151012 !important;
 }
 .aida-voice-panel select, .aida-voice-panel .wrap-inner,
 .aida-settings input, .aida-settings select {
-    background: #121d18 !important;
-    border: 1px solid #9bd9b226 !important;
-    color: #a7b9b0 !important;
+    background: #1b1416 !important;
+    border: 1px solid #c87a7a26 !important;
+    color: #d9b7b7 !important;
     font-size: 0.72rem !important;
     border-radius: 8px !important;
 }
 
 .aida-settings {
-    border: 1px solid #9bd9b220 !important;
+    border: 1px solid #c87a7a25 !important;
     border-radius: 10px !important;
-    background: #0f1714 !important;
-    box-shadow: inset 0 0 0 1px #9bd9b21a;
+    background: #151012 !important;
+    box-shadow: inset 0 0 0 1px #c87a7a1a;
 }
 .aida-settings button {
     border-radius: 8px !important;
 }
 .aida-settings-status textarea {
-    color: #9bd9b2 !important;
+    color: #c87a7a !important;
 }
 .aida-voice-panel button {
-    background: #1d3027 !important;
-    border: 1px solid #9bd9b244 !important;
-    color: #ccead8 !important;
+    background: #2a1f22 !important;
+    border: 1px solid #c87a7a44 !important;
+    color: #f1c9c9 !important;
 }
 .aida-voice-panel button:hover {
-    background: #264136 !important;
+    background: #3a2a2e !important;
 }
 
 /* ── Clear button ───────────────────────────────────────── */
@@ -614,20 +632,14 @@ with gr.Blocks(
 
     # ── Mode ─────────────────────────────────────────────────────────────────
     mode = gr.Radio(
-        choices=["Text", "Voice", "Hybrid"],
-        value="Hybrid",
+        choices=["Text", "Voice"],
+        value="Voice",
         show_label=False,
         container=False,
         elem_classes=["aida-mode"],
     )
 
-    gr.HTML("""
-    <div class="jarvis-core">
-      <div class="jarvis-core-ring">
-        <div class="jarvis-core-dot"></div>
-      </div>
-    </div>
-    """)
+    core_view = gr.HTML(core_markup(False))
 
     # ── Settings ─────────────────────────────────────────────────────────────
     with gr.Accordion("⚙ Settings", open=False, elem_classes=["aida-settings"]):
@@ -746,7 +758,7 @@ with gr.Blocks(
     submit_cfg = dict(
         fn=handle_text,
         inputs=[text_in, chatbox, mode],
-        outputs=[chatbox, text_in, audio_out],
+        outputs=[chatbox, text_in, audio_out, core_view],
     )
     text_in.submit(**submit_cfg)
     send_btn.click(**submit_cfg)
@@ -754,7 +766,7 @@ with gr.Blocks(
     talk_btn.click(
         fn=handle_voice_capture,
         inputs=[chatbox, mode, mic_choice, mic_muted, record_seconds],
-        outputs=[chatbox, audio_out, voice_state, last_transcript],
+        outputs=[chatbox, audio_out, voice_state, last_transcript, core_view],
     )
     start_wake_btn.click(
         fn=start_wake_mode,
