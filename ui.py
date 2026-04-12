@@ -64,6 +64,17 @@ def core_markup(glow: bool = False) -> str:
     </div>
     """
 
+
+def core_markup(glow: bool = False) -> str:
+    active = " core-active" if glow else ""
+    return f"""
+    <div class=\"jarvis-core{active}\">
+      <div class=\"jarvis-core-ring\">
+        <div class=\"jarvis-core-dot\"></div>
+      </div>
+    </div>
+    """
+
 if ELL_AVAILABLE and ell is not None:
     ell.init(store="./data/ell_store", autocommit=True, verbose=False)
 
@@ -85,14 +96,34 @@ def get_microphones() -> list[str]:
     """Returns a list of available input devices."""
     try:
         import sounddevice as sd
-        num_devices = len(sd.query_devices())
+        devices = sd.query_devices()
+        default_in, _ = sd.default.device
+
+        # Keep only real input devices, de-duplicate by clean name, and cap list.
+        seen: set[str] = set()
         mics: list[str] = []
-        for i in range(num_devices):
-            # sd.query_devices(i) returns a proper dict — avoids Pylance
-            # subscript error that occurs when iterating DeviceList (a tuple).
-            d: dict = sd.query_devices(i)  # type: ignore[assignment]
-            if d["max_input_channels"] > 0:
-                mics.append(f"{i}: {d['name']}")
+
+        # Put default mic first (if valid).
+        if isinstance(default_in, int) and default_in >= 0:
+            d0: dict = sd.query_devices(default_in)  # type: ignore[assignment]
+            if d0.get("max_input_channels", 0) > 0:
+                name0 = str(d0["name"]).strip()
+                seen.add(name0.lower())
+                mics.append(f"{default_in}: {name0}")
+
+        for i, dev in enumerate(devices):
+            d: dict = dev  # type: ignore[assignment]
+            if d.get("max_input_channels", 0) <= 0:
+                continue
+            name = str(d["name"]).strip()
+            norm = name.lower()
+            if norm in seen:
+                continue
+            seen.add(norm)
+            mics.append(f"{i}: {name}")
+            if len(mics) >= 5:
+                break
+
         return mics if mics else ["Default microphone"]
     except Exception:
         return ["Default microphone"]
@@ -145,10 +176,10 @@ def handle_voice_capture(
     history: list, mode: str, mic_choice: str, muted: bool, duration: float
 ):
     if mode != "Voice":
-        return history, None, "Voice mode is disabled.", "", core_markup(False)
+        return history, "Voice mode is disabled.", "", core_markup(False)
     if muted:
         history = history + [make_aida_msg("🔇 Microphone muted. Unmute to speak.")]
-        return history, None, "Muted. Unmute microphone to record.", "", core_markup(False)
+        return history, "Muted. Unmute microphone to record.", "", core_markup(False)
 
     audio_path = None
     try:
@@ -156,13 +187,13 @@ def handle_voice_capture(
         transcript = transcribe_audio(audio_path, mic_choice)
         history = history + [make_user_msg(f"🎤 {transcript}")]
         if transcript.startswith("["):
-            return history, None, "Speech-to-text failed.", transcript, core_markup(False)
+            return history, "Speech-to-text failed.", transcript, core_markup(False)
         response = _run_async(orchestrator.process(transcript))
         history = history + [make_aida_msg(response)]
-        return history, speak_text(response), "✅ Voice captured and processed.", transcript, core_markup(True)
+        return history, "✅ Voice captured and processed.", transcript, core_markup(True)
     except Exception as e:
         history = history + [make_aida_msg(f"[Voice capture error: {e}]")]
-        return history, None, f"Voice capture error: {e}", "", core_markup(False)
+        return history, f"Voice capture error: {e}", "", core_markup(False)
     finally:
         if audio_path and os.path.exists(audio_path):
             try:
@@ -214,16 +245,15 @@ def make_aida_msg(text: str) -> dict:
 
 def handle_text(user_message: str, history: list, mode: str):
     if not user_message.strip():
-        yield history, "", None, core_markup(False)
+        yield history, "", core_markup(False)
         return
 
     history = history + [make_user_msg(user_message)]
-    yield history, "", None, core_markup(False)
+    yield history, "", core_markup(False)
 
     response  = _run_async(orchestrator.process(user_message))
     history   = history + [make_aida_msg(response)]
-    audio_out = speak_text(response) if mode == "Voice" else None
-    yield history, "", audio_out, core_markup(True)
+    yield history, "", core_markup(True)
 
 
 def handle_voice(audio_path, history: list, mode: str, mic_choice: str):
@@ -240,7 +270,7 @@ def handle_voice(audio_path, history: list, mode: str, mic_choice: str):
 
 def clear_chat():
     orchestrator.buffer.clear()
-    return [], None
+    return []
 
 
 def toggle_voice_ui(m: str):
@@ -248,7 +278,6 @@ def toggle_voice_ui(m: str):
     text_enabled = m != "Voice"
     chat_h = 150 if show else 320
     return (
-        gr.update(visible=show),
         gr.update(visible=show),
         gr.update(visible=text_enabled),
         gr.update(height=chat_h, min_height=chat_h),
@@ -641,17 +670,19 @@ with gr.Blocks(
 
     # ── Voice panel (hidden in Text mode) ────────────────────────────────────
     with gr.Group(visible=True, elem_classes=["aida-voice-panel"]) as voice_group:
-        gr.Markdown(
-            "Voice mode is **output-only**: AIDA replies with voice (TTS). "
-            "Speech capture/wake-word is disabled for stability."
+        gr.Markdown("Voice mode: choose mic and press TALK.")
+        record_seconds = gr.Slider(
+            minimum=2,
+            maximum=8,
+            step=1,
+            value=4,
+            label="Record duration (sec)",
         )
-
-    # ── Audio output (hidden element — autoplay only) ─────────────────────────
-    audio_out = gr.Audio(
-        autoplay=True,
-        interactive=False,
-        visible=False,   # hidden — we only need the autoplay, not UI chrome
-    )
+        with gr.Row(equal_height=True):
+            talk_btn = gr.Button("🎤 TALK", variant="secondary", size="sm")
+            mic_muted = gr.Checkbox(label="Mute mic", value=False)
+        voice_state = gr.Textbox(label="Voice status", value="Idle", interactive=False, lines=1)
+        last_transcript = gr.Textbox(label="Last transcript", value="", interactive=False, lines=2)
 
     # ── Clear ────────────────────────────────────────────────────────────────
     clear_btn = gr.Button(
@@ -666,17 +697,23 @@ with gr.Blocks(
     submit_cfg = dict(
         fn=handle_text,
         inputs=[text_in, chatbox, mode],
-        outputs=[chatbox, text_in, audio_out, core_view],
+        outputs=[chatbox, text_in, core_view],
     )
     text_in.submit(**submit_cfg)
     send_btn.click(**submit_cfg)
 
-    clear_btn.click(fn=clear_chat, outputs=[chatbox, audio_out])
+    talk_btn.click(
+        fn=handle_voice_capture,
+        inputs=[chatbox, mode, mic_choice, mic_muted, record_seconds],
+        outputs=[chatbox, voice_state, last_transcript, core_view],
+    )
+
+    clear_btn.click(fn=clear_chat, outputs=[chatbox])
 
     mode.change(
         fn=toggle_voice_ui,
         inputs=mode,
-        outputs=[voice_group, audio_out, text_row, chatbox],
+        outputs=[voice_group, text_row, chatbox],
     )
 
     save_settings_btn.click(
