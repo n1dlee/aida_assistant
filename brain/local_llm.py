@@ -49,6 +49,8 @@ class LocalLLM:
                     self.base_url,
                 )
                 return True
+                log.warning("Ollama reachable, but no models reported at %s", self.base_url)
+                return False
 
             if self.model_name not in names:
                 log.warning(
