@@ -66,23 +66,36 @@ class ModelSelector:
     ) -> Tuple[str, str]:
         """
         Returns (response_text, model_name_used).
-        Falls back to cloud if local fails.
+        Tries preferred model first, then automatically falls back
+        to the other configured provider.
         """
         use_cloud = self._should_use_cloud(user_input, history, intent)
 
-        if use_cloud and self.cloud.is_available():
-            try:
-                response = await self.cloud.complete(system, history, user_input)
-                return response, self.cloud.model_name
-            except Exception as e:
-                log.warning("Cloud LLM failed (%s), falling back to local.", e)
+        providers = []
+        if use_cloud:
+            providers = [("cloud", self.cloud), ("local", self.local)]
+        else:
+            providers = [("local", self.local), ("cloud", self.cloud)]
 
-        # Local
-        if self.local.is_available():
+        errors = []
+        for name, provider in providers:
+            if not provider.is_available():
+                log.debug("%s provider is not available.", name)
+                continue
             try:
-                response = await self.local.complete(system, history, user_input)
-                return response, self.local.model_name
+                response = await provider.complete(system, history, user_input)
+                return response, provider.model_name
             except Exception as e:
-                log.error("Local LLM also failed: %s", e)
+                errors.append((name, str(e)))
+                log.warning("%s LLM failed: %s", name.capitalize(), e)
+
+        if errors:
+            log.error("All available providers failed: %s", errors)
+            first_provider, first_error = errors[0]
+            return (
+                f"{first_provider.capitalize()} model failed: {first_error}. "
+                "Try a smaller local model (e.g. 3b/7b), or enable a cloud API key.",
+                "none",
+            )
 
         return "Sorry, no AI model is currently available. Please check your config.", "none"
