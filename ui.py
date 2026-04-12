@@ -8,6 +8,7 @@ ui.py — AIDA Desktop App
 import asyncio
 import logging
 import os
+import queue
 import sys
 import tempfile
 import threading
@@ -28,6 +29,7 @@ import gradio as gr
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.orchestrator import Orchestrator
+from voice.wake_word import WakeWordDetector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +38,9 @@ logging.basicConfig(
 log = logging.getLogger("aida.ui")
 
 orchestrator = Orchestrator()
+WAKE_EVENTS: "queue.Queue[tuple]" = queue.Queue()
+WAKE_RUNNING = False
+WAKE_THREAD: threading.Thread | None = None
 
 if ELL_AVAILABLE and ell is not None:
     ell.init(store="./data/ell_store", autocommit=True, verbose=False)
@@ -219,7 +224,7 @@ def clear_chat():
 def toggle_voice_ui(m: str):
     show = m in ("Voice", "Hybrid")
     text_enabled = m != "Voice"
-    chat_h = 520 if show else 640
+    chat_h = 260 if show else 320
     return (
         gr.update(visible=show),
         gr.update(visible=show),
@@ -272,6 +277,79 @@ def save_settings(gemini_key: str, openai_key: str, mic_choice: str):
     )
 
 
+def _wake_loop(mic_choice: str, duration: float, wake_word: str):
+    global WAKE_RUNNING
+    detector = WakeWordDetector(wake_word=wake_word)
+    WAKE_EVENTS.put(("status", f"Listening 24/7 for wake word: '{wake_word}'"))
+
+    if not detector.is_available():
+        WAKE_EVENTS.put(("status", "Wake word module unavailable (install openwakeword)."))
+        WAKE_RUNNING = False
+        return
+
+    while WAKE_RUNNING:
+        try:
+            triggered = detector._blocking_listen()
+            if not WAKE_RUNNING:
+                break
+            if not triggered:
+                continue
+
+            WAKE_EVENTS.put(("status", "Wake word detected. Capturing voice..."))
+            audio_path = record_from_mic(mic_choice, duration=max(2.0, float(duration)))
+            transcript = transcribe_audio(audio_path, mic_choice)
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+
+            if transcript.startswith("["):
+                WAKE_EVENTS.put(("status", f"STT failed: {transcript}"))
+                continue
+
+            response = asyncio.run(orchestrator.process(transcript))
+            WAKE_EVENTS.put(("message", transcript, response))
+            WAKE_EVENTS.put(("status", "Listening for wake word..."))
+        except Exception as e:
+            WAKE_EVENTS.put(("status", f"Wake loop error: {e}"))
+
+
+def start_wake_mode(mic_choice: str, duration: float, wake_word: str):
+    global WAKE_RUNNING, WAKE_THREAD
+    if WAKE_RUNNING:
+        return "Wake mode already running."
+    WAKE_RUNNING = True
+    WAKE_THREAD = threading.Thread(
+        target=_wake_loop,
+        args=(mic_choice, duration, (wake_word or "aida").strip().lower()),
+        daemon=True,
+    )
+    WAKE_THREAD.start()
+    return "Wake mode started."
+
+
+def stop_wake_mode():
+    global WAKE_RUNNING
+    WAKE_RUNNING = False
+    return "Wake mode stopped."
+
+
+def poll_wake_events(history: list):
+    status = "Listening..." if WAKE_RUNNING else "Idle"
+    transcript = ""
+    while not WAKE_EVENTS.empty():
+        event = WAKE_EVENTS.get()
+        if not event:
+            continue
+        if event[0] == "status":
+            status = event[1]
+        elif event[0] == "message":
+            user_text, bot_text = event[1], event[2]
+            history = history + [make_user_msg(f"🎤 {user_text}"), make_aida_msg(bot_text)]
+            transcript = user_text
+    return history, status, transcript
+
+
 # ─── Custom CSS ── 420×870 window, no page-level scroll ──────────────────────
 # All sizing is tuned so every element fits inside 870 px total height.
 
@@ -287,17 +365,14 @@ html, body {
 }
 
 .gradio-container {
-    max-width: 830px !important;
-    width: 830px !important;
-    min-height: 1100px !important;
-    max-height: 1100px !important;
-    overflow-x: hidden !important;
-    overflow-y: auto !important;
-    background:
-      radial-gradient(circle at 50% -10%, #264436 0%, transparent 42%),
-      linear-gradient(180deg, #0e1814 0%, #090f0d 100%) !important;
+    max-width: 430px !important;
+    width: 430px !important;
+    min-height: 900px !important;
+    max-height: 900px !important;
+    overflow: hidden !important;
+    background: linear-gradient(180deg, #0f1412 0%, #0a0f0d 100%) !important;
     margin: 0 !important;
-    padding: 0 6px 0 6px !important;
+    padding: 0 10px !important;
     box-sizing: border-box;
 }
 .gradio-container::before {
@@ -320,63 +395,46 @@ footer { display: none !important; }
     text-align: center;
     padding: 14px 0 4px;
     letter-spacing: 6px;
-    font-size: 2rem;
+    font-size: 1.45rem;
     font-weight: 800;
     color: #9bd9b2;
     text-shadow: 0 0 18px #9bd9b255;
 }
 .aida-sub {
     text-align: center;
-    font-size: 0.72rem;
-    letter-spacing: 4px;
+    font-size: 0.6rem;
+    letter-spacing: 3px;
     color: #ffffff28;
     margin-bottom: 6px;
 }
 
 .jarvis-core {
-    width: 100%;
     display: flex;
     justify-content: center;
-    margin: 8px 0 12px;
+    margin: 8px 0 10px;
 }
-.jarvis-ring {
-    width: 250px;
-    height: 250px;
+.jarvis-core-ring {
+    width: 160px;
+    height: 160px;
     border-radius: 999px;
+    border: 1px solid #9bd9b24a;
+    background: radial-gradient(circle, #9bd9b235 0%, #0f171400 72%);
+    box-shadow: inset 0 0 24px #9bd9b22b, 0 0 26px #00000055;
     position: relative;
-    border: 2px solid #72cfc66b;
-    box-shadow: 0 0 40px #2ecbc642, inset 0 0 40px #2ecbc620;
-    background: radial-gradient(circle, #7bc4be38 0%, #0f171400 68%);
-    animation: pulse 2.6s ease-in-out infinite;
 }
-.jarvis-ring::before, .jarvis-ring::after {
+.jarvis-core-ring::before {
     content: "";
     position: absolute;
     inset: 18px;
     border-radius: 999px;
-    border: 2px dashed #72cfc647;
-    animation: spin 12s linear infinite;
+    border: 1px dashed #9bd9b23d;
 }
-.jarvis-ring::after {
-    inset: 42px;
-    border-style: solid;
-    border-color: #9bd9b250;
-    animation-direction: reverse;
-    animation-duration: 8s;
-}
-.jarvis-center {
+.jarvis-core-dot {
     position: absolute;
-    inset: 84px;
+    inset: 58px;
     border-radius: 999px;
-    background: radial-gradient(circle, #d7fff6 0%, #84ece0 45%, #4acdc045 100%);
-    box-shadow: 0 0 30px #97f5ec80;
+    background: radial-gradient(circle, #e8fffa 0%, #96ddd3 52%, #96ddd300 100%);
 }
-@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-@keyframes pulse {
-  0%, 100% { transform: scale(1); filter: drop-shadow(0 0 0 #00fff000); }
-  50% { transform: scale(1.03); filter: drop-shadow(0 0 12px #52e6d888); }
-}
-
 /* ── Status bar ─────────────────────────────────────────── */
 .aida-status p {
     text-align: center;
@@ -389,11 +447,11 @@ footer { display: none !important; }
 
 /* ── Chatbot ─────────────────────────────────────────────── */
 .aida-chat {
-    background: transparent !important;
-    border: 1px solid #9bd9b222 !important;
-    border-radius: 14px !important;
-    backdrop-filter: blur(6px);
-    box-shadow: inset 0 0 0 1px #9bd9b20e, 0 12px 30px #0000003f;
+    background: #141917cc !important;
+    border: 1px solid #ffffff1e !important;
+    border-radius: 18px !important;
+    backdrop-filter: blur(10px);
+    box-shadow: inset 0 1px 0 #ffffff14, 0 8px 20px #00000038;
 }
 .aida-chat .message-bubble-border {
     border-radius: 8px !important;
@@ -536,7 +594,7 @@ MIC_LIST = get_microphones()
 #  - clear btn:    ~30px
 #  - gaps/padding: ~36px
 #  = dynamic, so controls at bottom stay visible even in Voice/Hybrid.
-CHAT_HEIGHT = 500
+CHAT_HEIGHT = 260
 
 with gr.Blocks(
     title="AIDA",
@@ -548,7 +606,7 @@ with gr.Blocks(
     # ── Header ──────────────────────────────────────────────────────────────
     gr.HTML("""
     <div class="aida-header">◈ AIDA</div>
-    <div class="aida-sub">VOICE-READY FUTURISTIC ASSISTANT</div>
+    <div class="aida-sub">MINIMAL VOICE ASSISTANT</div>
     """)
 
     # ── Status ───────────────────────────────────────────────────────────────
@@ -565,8 +623,8 @@ with gr.Blocks(
 
     gr.HTML("""
     <div class="jarvis-core">
-      <div class="jarvis-ring">
-        <div class="jarvis-center"></div>
+      <div class="jarvis-core-ring">
+        <div class="jarvis-core-dot"></div>
       </div>
     </div>
     """)
@@ -636,6 +694,15 @@ with gr.Blocks(
         voice_hint = gr.Markdown(
             "Voice mode: choose mic → set duration → press **TALK** and speak immediately."
         )
+        wake_word = gr.Textbox(
+            label="Wake word",
+            value="aida",
+            placeholder="aida",
+            lines=1,
+        )
+        with gr.Row(equal_height=True):
+            start_wake_btn = gr.Button("▶ Start 24/7 Wake Mode", variant="secondary", size="sm")
+            stop_wake_btn = gr.Button("■ Stop", variant="secondary", size="sm")
         record_seconds = gr.Slider(
             minimum=2,
             maximum=12,
@@ -689,6 +756,15 @@ with gr.Blocks(
         inputs=[chatbox, mode, mic_choice, mic_muted, record_seconds],
         outputs=[chatbox, audio_out, voice_state, last_transcript],
     )
+    start_wake_btn.click(
+        fn=start_wake_mode,
+        inputs=[mic_choice, record_seconds, wake_word],
+        outputs=[voice_state],
+    )
+    stop_wake_btn.click(
+        fn=stop_wake_mode,
+        outputs=[voice_state],
+    )
 
     clear_btn.click(fn=clear_chat, outputs=[chatbox, audio_out])
 
@@ -702,6 +778,13 @@ with gr.Blocks(
         fn=save_settings,
         inputs=[gemini_key, openai_key, mic_choice],
         outputs=[status_md, settings_status],
+    )
+
+    wake_timer = gr.Timer(value=1.0, active=True)
+    wake_timer.tick(
+        fn=poll_wake_events,
+        inputs=[chatbox],
+        outputs=[chatbox, voice_state, last_transcript],
     )
 
 
@@ -734,14 +817,14 @@ if __name__ == "__main__":
         import time
         time.sleep(2)   # wait for Gradio to bind
 
-        log.info("Opening native window (830×1100)...")
+        log.info("Opening native window (430×900)...")
         webview.create_window(
             title="AIDA",
             url=f"http://127.0.0.1:{PORT}",
-            width=830,
-            height=1100,
+            width=430,
+            height=900,
             resizable=False,        # fixed size — layout is tuned for this
-            min_size=(830, 1100),
+            min_size=(430, 900),
             frameless=False,
             on_top=False,
             background_color="#0a0c0f",
