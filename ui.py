@@ -387,6 +387,16 @@ html, body {
     padding: 0 10px !important;
     box-sizing: border-box;
 }
+.gradio-container::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    background-image: linear-gradient(#9bd9b208 1px, transparent 1px),
+                      linear-gradient(90deg, #9bd9b208 1px, transparent 1px);
+    background-size: 28px 28px;
+    mask-image: radial-gradient(circle at center, black 40%, transparent 95%);
+}
 
 /* Hide Gradio footer */
 footer { display: none !important; }
