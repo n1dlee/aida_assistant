@@ -294,6 +294,8 @@ html, body {
     background:
       radial-gradient(circle at 50% -10%, #264436 0%, transparent 42%),
       linear-gradient(180deg, #0e1814 0%, #090f0d 100%) !important;
+    overflow: hidden !important;
+    background: radial-gradient(circle at top, #15241f 0%, #0b1210 55%, #090f0d 100%) !important;
     margin: 0 !important;
     padding: 0 6px 0 6px !important;
     box-sizing: border-box;
@@ -437,21 +439,12 @@ footer { display: none !important; }
     border: 1px solid #9bd9b220 !important;
     border-radius: 10px !important;
     background: #0f1714 !important;
-    box-shadow: inset 0 0 0 1px #9bd9b21a;
 }
 .aida-settings button {
     border-radius: 8px !important;
 }
 .aida-settings-status textarea {
     color: #9bd9b2 !important;
-}
-.aida-voice-panel button {
-    background: #1d3027 !important;
-    border: 1px solid #9bd9b244 !important;
-    color: #ccead8 !important;
-}
-.aida-voice-panel button:hover {
-    background: #264136 !important;
 }
 
 /* ── Clear button ───────────────────────────────────────── */
@@ -621,6 +614,7 @@ with gr.Blocks(
         fn=toggle_voice_ui,
         inputs=mode,
         outputs=[voice_group, audio_out, text_row, chatbox],
+        outputs=[voice_group, audio_out, text_row],
     )
 
     save_settings_btn.click(
