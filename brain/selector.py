@@ -14,13 +14,16 @@ log = logging.getLogger("aida.brain.selector")
 
 # Complexity keywords that push toward cloud
 CLOUD_KEYWORDS = [
-    "analyze", "аналiz", "compare", "explain in detail", "write code",
+    "analyze", "анализ", "compare", "explain in detail", "write code",
     "debug", "translate", "summarize this document", "plan", "strategy",
     "объясни подробно", "напиши код", "проанализируй", "сравни",
 ]
 
 # Token threshold — if conversation history is long, cloud handles better
 CLOUD_CONTEXT_THRESHOLD = 2000
+
+# Max score contribution from keyword matching (prevents runaway accumulation)
+_KEYWORD_SCORE_CAP = 0.4
 
 
 class ModelSelector:
@@ -33,10 +36,9 @@ class ModelSelector:
         score = 0.0
         lower = user_input.lower()
 
-        # Keyword complexity
-        for kw in CLOUD_KEYWORDS:
-            if kw in lower:
-                score += 0.3
+        # Keyword complexity — capped so many keywords don't bypass min()
+        keyword_hits = sum(1 for kw in CLOUD_KEYWORDS if kw in lower)
+        score += min(_KEYWORD_SCORE_CAP, keyword_hits * 0.2)
 
         # Length of input
         if len(user_input) > 200:

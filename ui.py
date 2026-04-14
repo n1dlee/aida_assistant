@@ -1,8 +1,13 @@
 """
 ui.py — AIDA Desktop App
-Нативное окно через pywebview + Gradio 6.12
-Размер окна: 420×870, без скроллинга, минималистичный дизайн
+Нативное окно через pywebview + Gradio
+Размер окна: 430×900, без скроллинга, минималистичный дизайн
 Запуск: python ui.py
+
+Wake Word режим:
+  Нажми "🔊 Wake Word ON" → фоновый поток слушает "Aida / Аида".
+  Обнаружив слово — автоматически записывает до тишины (VAD) и отвечает.
+  Переключи обратно в "Text" или "🔴 Wake Word OFF" чтобы остановить.
 """
 
 import asyncio
@@ -10,12 +15,11 @@ import logging
 import os
 import queue
 import sys
-import tempfile
 import threading
+import time
 from pathlib import Path
 
 # ── ell: must be initialised BEFORE it is used ──────────────────────────────
-# Assign None first so Pylance never sees it as "possibly unbound"
 ell = None  # type: ignore[assignment]
 ELL_AVAILABLE = False
 try:
@@ -29,7 +33,7 @@ import gradio as gr
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.orchestrator import Orchestrator
-from voice.wake_word import WakeWordDetector
+from voice.listener import VoiceListener
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,192 +41,76 @@ logging.basicConfig(
 )
 log = logging.getLogger("aida.ui")
 
-orchestrator = Orchestrator()
-WAKE_EVENTS: "queue.Queue[tuple]" = queue.Queue()
-WAKE_RUNNING = False
-WAKE_THREAD: threading.Thread | None = None
-
-
-def core_markup(glow: bool = False) -> str:
-    active = " core-active" if glow else ""
-    return f"""
-    <div class=\"jarvis-core{active}\">
-      <div class=\"jarvis-core-ring\">
-        <div class=\"jarvis-core-dot\"></div>
-      </div>
-    </div>
-    """
-
-
-def core_markup(glow: bool = False) -> str:
-    active = " core-active" if glow else ""
-    return f"""
-    <div class=\"jarvis-core{active}\">
-      <div class=\"jarvis-core-ring\">
-        <div class=\"jarvis-core-dot\"></div>
-      </div>
-    </div>
-    """
-
-
-def core_markup(glow: bool = False) -> str:
-    active = " core-active" if glow else ""
-    return f"""
-    <div class=\"jarvis-core{active}\">
-      <div class=\"jarvis-core-ring\">
-        <div class=\"jarvis-core-dot\"></div>
-      </div>
-    </div>
-    """
-
 if ELL_AVAILABLE and ell is not None:
     ell.init(store="./data/ell_store", autocommit=True, verbose=False)
 
+# ── Shared state ─────────────────────────────────────────────────────────────
+orchestrator  = Orchestrator()
+voice_listener = VoiceListener()
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# Queue: wake-word thread puts (transcript, response) here; UI polls it
+WAKE_EVENTS: "queue.Queue[tuple]" = queue.Queue()
+WAKE_RUNNING  = False
+WAKE_THREAD: threading.Thread | None = None
+
+
+# ── Core visual markup (defined ONCE) ────────────────────────────────────────
+
+def core_markup(glow: bool = False) -> str:
+    active = " core-active" if glow else ""
+    return f"""
+    <div class="jarvis-core{active}">
+      <div class="jarvis-core-ring">
+        <div class="jarvis-core-dot"></div>
+      </div>
+    </div>
+    """
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _run_async(coro):
     """Run coroutine from a sync context, whether a loop is running or not."""
     try:
-        # Python 3.10+: get_running_loop() (non-deprecated)
         loop = asyncio.get_running_loop()
         return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=60)
     except RuntimeError:
-        # No running loop — safe to use asyncio.run()
         return asyncio.run(coro)
 
 
 def get_microphones() -> list[str]:
-    """Returns a list of available input devices."""
     try:
         import sounddevice as sd
-        devices = sd.query_devices()
+        devices   = sd.query_devices()
         default_in, _ = sd.default.device
-
-        # Keep only real input devices, de-duplicate by clean name, and cap list.
         seen: set[str] = set()
         mics: list[str] = []
-
-        # Put default mic first (if valid).
         if isinstance(default_in, int) and default_in >= 0:
             d0: dict = sd.query_devices(default_in)  # type: ignore[assignment]
             if d0.get("max_input_channels", 0) > 0:
                 name0 = str(d0["name"]).strip()
                 seen.add(name0.lower())
                 mics.append(f"{default_in}: {name0}")
-
         for i, dev in enumerate(devices):
             d: dict = dev  # type: ignore[assignment]
             if d.get("max_input_channels", 0) <= 0:
                 continue
             name = str(d["name"]).strip()
-            norm = name.lower()
-            if norm in seen:
+            if name.lower() in seen:
                 continue
-            seen.add(norm)
+            seen.add(name.lower())
             mics.append(f"{i}: {name}")
             if len(mics) >= 5:
                 break
-
         return mics if mics else ["Default microphone"]
     except Exception:
         return ["Default microphone"]
 
 
-def transcribe_audio(audio_path: str, mic_index: str) -> str:
-    try:
-        from faster_whisper import WhisperModel
-        m = WhisperModel(
-            os.getenv("WHISPER_MODEL", "small"), device="cpu", compute_type="int8"
-        )
-        segs, _ = m.transcribe(audio_path, beam_size=5)
-        return " ".join(s.text for s in segs).strip()
-    except ImportError:
-        return "[faster-whisper not installed — pip install faster-whisper]"
-    except Exception as e:
-        return f"[STT error: {e}]"
-
-
-def record_from_mic(mic_choice: str, duration: float = 5.0) -> str:
-    """Record from selected input device and return temporary WAV path."""
-    import sounddevice as sd
-    import soundfile as sf
-
-    sample_rate = 16000
-    device_idx = None
-    if mic_choice and ":" in mic_choice:
-        try:
-            device_idx = int(mic_choice.split(":", 1)[0].strip())
-        except ValueError:
-            device_idx = None
-
-    log.info("Recording %.1fs from mic: %s", duration, mic_choice or "default")
-    audio = sd.rec(
-        int(duration * sample_rate),
-        samplerate=sample_rate,
-        channels=1,
-        dtype="float32",
-        device=device_idx,
-    )
-    sd.wait()
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
-        tmp = fh.name
-    sf.write(tmp, audio, sample_rate)
-    return tmp
-
-
-def handle_voice_capture(
-    history: list, mode: str, mic_choice: str, muted: bool, duration: float
-):
-    if mode != "Voice":
-        return history, "Voice mode is disabled.", "", core_markup(False)
-    if muted:
-        history = history + [make_aida_msg("🔇 Microphone muted. Unmute to speak.")]
-        return history, "Muted. Unmute microphone to record.", "", core_markup(False)
-
-    audio_path = None
-    try:
-        audio_path = record_from_mic(mic_choice, duration=max(2.0, float(duration)))
-        transcript = transcribe_audio(audio_path, mic_choice)
-        history = history + [make_user_msg(f"🎤 {transcript}")]
-        if transcript.startswith("["):
-            return history, "Speech-to-text failed.", transcript, core_markup(False)
-        response = _run_async(orchestrator.process(transcript))
-        history = history + [make_aida_msg(response)]
-        return history, "✅ Voice captured and processed.", transcript, core_markup(True)
-    except Exception as e:
-        history = history + [make_aida_msg(f"[Voice capture error: {e}]")]
-        return history, f"Voice capture error: {e}", "", core_markup(False)
-    finally:
-        if audio_path and os.path.exists(audio_path):
-            try:
-                os.remove(audio_path)
-            except OSError:
-                pass
-
-
-def speak_text(text: str) -> str | None:
-    """TTS → WAV file path, or None if TTS unavailable."""
-    try:
-        import pyttsx3
-        engine = pyttsx3.init()
-        engine.setProperty("rate", int(os.getenv("AIDA_TTS_RATE", "170")))
-        # mktemp() is deprecated since Python 2.3 — use NamedTemporaryFile
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fh:
-            tmp = fh.name
-        engine.save_to_file(text, tmp)
-        engine.runAndWait()
-        return tmp if os.path.exists(tmp) else None
-    except Exception as e:
-        log.debug("TTS skipped: %s", e)
-        return None
-
-
 def get_status() -> str:
-    local_ok  = orchestrator.selector.local.is_available()
-    cloud_ok  = orchestrator.selector.cloud.is_available()
-    mem       = orchestrator.vector_store.count()
+    local_ok = orchestrator.selector.local.is_available()
+    cloud_ok = orchestrator.selector.cloud.is_available()
+    mem      = orchestrator.vector_store.count()
     parts: list[str] = []
     if local_ok:
         parts.append(f"⬡ {orchestrator.selector.local.model_name}")
@@ -232,7 +120,19 @@ def get_status() -> str:
     return "  ·  ".join(parts) if parts else "⚠ No model"
 
 
-# ─── Message helpers (Gradio 6 requires role/content dicts) ──────────────────
+def speak_text(text: str) -> None:
+    """TTS — fire-and-forget. Does nothing if pyttsx3 unavailable."""
+    try:
+        import pyttsx3
+        engine = pyttsx3.init()
+        engine.setProperty("rate", int(os.getenv("AIDA_TTS_RATE", "170")))
+        engine.say(text)
+        engine.runAndWait()
+    except Exception as e:
+        log.debug("TTS skipped: %s", e)
+
+
+# ── Message helpers ──────────────────────────────────────────────────────────
 
 def make_user_msg(text: str) -> dict:
     return {"role": "user", "content": text}
@@ -241,31 +141,127 @@ def make_aida_msg(text: str) -> dict:
     return {"role": "assistant", "content": text}
 
 
-# ─── Event handlers ───────────────────────────────────────────────────────────
+# ── Wake Word background thread ──────────────────────────────────────────────
+
+def _wake_word_loop():
+    """
+    Runs in a daemon thread.
+    1. Waits for "Aida / Аида" via Whisper-based keyword spotting (VoiceListener).
+    2. Records the following utterance with VAD (stops on silence).
+    3. Sends to orchestrator.
+    4. Puts (transcript, response) into WAKE_EVENTS queue for UI polling.
+    5. Optionally speaks the response via TTS.
+    """
+    global WAKE_RUNNING
+    log.info("Wake word thread started.")
+
+    if not voice_listener.is_available():
+        log.warning("VoiceListener not available — wake word thread exiting.")
+        WAKE_RUNNING = False
+        return
+
+    while WAKE_RUNNING:
+        try:
+            transcript = _run_async(
+                voice_listener.listen_with_wake_word(
+                    wake_keywords=["aida", "аида", "aide", "айда"]
+                )
+            )
+            if not transcript.strip():
+                continue
+
+            log.info("Wake utterance: %r", transcript)
+            response = _run_async(orchestrator.process(transcript))
+            WAKE_EVENTS.put((transcript, response))
+
+            # Optional TTS output
+            if os.getenv("AIDA_WAKE_TTS", "1") == "1":
+                speak_text(response)
+
+        except Exception as exc:
+            if WAKE_RUNNING:
+                log.error("Wake word loop error: %s", exc)
+                time.sleep(1)   # brief pause before retrying
+
+    log.info("Wake word thread stopped.")
+
+
+def start_wake_word() -> tuple[str, str]:
+    """Start the background wake word detection thread."""
+    global WAKE_RUNNING, WAKE_THREAD
+    if WAKE_RUNNING:
+        return "🔴 Wake Word OFF", "⚠ Already running"
+    if not voice_listener.is_available():
+        return "🔊 Wake Word ON", "⚠ faster-whisper not installed"
+    WAKE_RUNNING = True
+    WAKE_THREAD  = threading.Thread(target=_wake_word_loop, daemon=True, name="WakeWord")
+    WAKE_THREAD.start()
+    return "🔴 Wake Word OFF", "✅ Wake word listening active — say 'Aida'"
+
+
+def stop_wake_word() -> tuple[str, str]:
+    """Stop the background wake word detection thread."""
+    global WAKE_RUNNING
+    WAKE_RUNNING = False
+    return "🔊 Wake Word ON", "⏹ Wake word stopped"
+
+
+def toggle_wake_word(btn_label: str) -> tuple[str, str]:
+    if "ON" in btn_label:
+        return start_wake_word()
+    return stop_wake_word()
+
+
+def poll_wake_events(history: list) -> list:
+    """Called by gr.Timer every 500 ms — drains WAKE_EVENTS and appends to chat."""
+    updated = list(history)
+    try:
+        while True:
+            transcript, response = WAKE_EVENTS.get_nowait()
+            updated.append(make_user_msg(f"🎙️ {transcript}"))
+            updated.append(make_aida_msg(response))
+    except queue.Empty:
+        pass
+    return updated
+
+
+# ── Text & voice handlers ────────────────────────────────────────────────────
 
 def handle_text(user_message: str, history: list, mode: str):
     if not user_message.strip():
         yield history, "", core_markup(False)
         return
-
     history = history + [make_user_msg(user_message)]
     yield history, "", core_markup(False)
-
-    response  = _run_async(orchestrator.process(user_message))
-    history   = history + [make_aida_msg(response)]
+    response = _run_async(orchestrator.process(user_message))
+    history  = history + [make_aida_msg(response)]
     yield history, "", core_markup(True)
 
 
-def handle_voice(audio_path, history: list, mode: str, mic_choice: str):
-    if audio_path is None:
-        return history, None
-    transcript = transcribe_audio(audio_path, mic_choice)
-    history    = history + [make_user_msg(f"🎤 {transcript}")]
-    if transcript.startswith("["):
-        return history, None
-    response = _run_async(orchestrator.process(transcript))
-    history  = history + [make_aida_msg(response)]
-    return history, speak_text(response)
+def handle_voice_capture(history: list, mode: str, muted: bool):
+    """
+    TALK button handler — uses VAD-based recording (no fixed timer).
+    Stops automatically when silence > AIDA_SILENCE_TIMEOUT seconds.
+    """
+    if mode != "Voice":
+        return history, "Voice mode is disabled.", core_markup(False)
+    if muted:
+        history = history + [make_aida_msg("🔇 Microphone muted. Unmute to speak.")]
+        return history, "Muted.", core_markup(False)
+    if not voice_listener.is_available():
+        return history, "⚠ faster-whisper not installed.", core_markup(False)
+
+    try:
+        transcript = _run_async(voice_listener.listen())
+        history    = history + [make_user_msg(f"🎤 {transcript}")]
+        if not transcript.strip():
+            return history, "Nothing heard.", core_markup(False)
+        response   = _run_async(orchestrator.process(transcript))
+        history    = history + [make_aida_msg(response)]
+        return history, "✅ Done.", core_markup(True)
+    except Exception as e:
+        history = history + [make_aida_msg(f"[Voice error: {e}]")]
+        return history, f"Error: {e}", core_markup(False)
 
 
 def clear_chat():
@@ -289,10 +285,9 @@ def _set_env_value(env_path: Path, key: str, value: str):
     existing = []
     if env_path.exists():
         existing = env_path.read_text(encoding="utf-8").splitlines()
-
-    prefix = f"{key}="
+    prefix   = f"{key}="
     replaced = False
-    out = []
+    out      = []
     for line in existing:
         if line.startswith(prefix):
             out.append(f"{prefix}{value}")
@@ -301,35 +296,26 @@ def _set_env_value(env_path: Path, key: str, value: str):
             out.append(line)
     if not replaced:
         out.append(f"{prefix}{value}")
-
     env_path.write_text("\n".join(out).strip() + "\n", encoding="utf-8")
 
 
-def save_settings(gemini_key: str, openai_key: str, mic_choice: str):
+def save_settings(gemini_key: str, openai_key: str):
     gemini_key = (gemini_key or "").strip()
     openai_key = (openai_key or "").strip()
-
     os.environ["GEMINI_API_KEY"] = gemini_key
     os.environ["OPENAI_API_KEY"] = openai_key
-
     orchestrator.selector.cloud.gemini_key = gemini_key
     orchestrator.selector.cloud.openai_key = openai_key
     orchestrator.selector.cloud.model_name = (
         "gemini-2.0-flash" if gemini_key else "gpt-4o-mini"
     )
-
     env_path = Path(__file__).resolve().parent / ".env"
     _set_env_value(env_path, "GEMINI_API_KEY", gemini_key)
     _set_env_value(env_path, "OPENAI_API_KEY", openai_key)
-
-    return (
-        get_status(),
-        f"✅ Settings saved. Mic: {mic_choice or 'default'}",
-    )
+    return get_status(), "✅ Settings saved."
 
 
-# ─── Custom CSS ── 420×870 window, no page-level scroll ──────────────────────
-# All sizing is tuned so every element fits inside 870 px total height.
+# ── Custom CSS ────────────────────────────────────────────────────────────────
 
 CSS = """
 /* ── Reset / root ──────────────────────────────────────── */
@@ -365,7 +351,6 @@ html, body {
     mask-image: radial-gradient(circle at center, black 40%, transparent 95%);
 }
 
-/* Hide Gradio footer */
 footer { display: none !important; }
 .built-with { display: none !important; }
 
@@ -420,6 +405,7 @@ footer { display: none !important; }
 .core-active .jarvis-core-dot {
     box-shadow: 0 0 22px #ff8f8f99;
 }
+
 /* ── Status bar ─────────────────────────────────────────── */
 .aida-status p {
     text-align: center;
@@ -441,14 +427,12 @@ footer { display: none !important; }
 .aida-chat .message-bubble-border {
     border-radius: 8px !important;
 }
-/* user bubble */
 .aida-chat [data-testid="user"] .bubble-wrap {
     background: #c06c6c1f !important;
     border: 1px solid #c06c6c44 !important;
     color: #f5dbdb !important;
     font-size: 0.82rem !important;
 }
-/* assistant bubble */
 .aida-chat [data-testid="bot"] .bubble-wrap {
     background: #131a17 !important;
     border: 1px solid #ffffff14 !important;
@@ -522,6 +506,21 @@ footer { display: none !important; }
     border-radius: 8px !important;
 }
 
+/* ── Wake word button ───────────────────────────────────── */
+.wake-btn button {
+    width: 100% !important;
+    background: #1a1020 !important;
+    border: 1px solid #9b72dd66 !important;
+    border-radius: 8px !important;
+    color: #c4a8f5 !important;
+    font-size: 0.72rem !important;
+    letter-spacing: 1px;
+    padding: 5px 0 !important;
+}
+.wake-btn button:hover {
+    background: #231530 !important;
+}
+
 .aida-settings {
     border: 1px solid #c87a7a25 !important;
     border-radius: 10px !important;
@@ -566,27 +565,14 @@ footer { display: none !important; }
 """
 
 
-# ─── UI layout (fits exactly in 420×870, zero page scroll) ───────────────────
+# ── UI layout ─────────────────────────────────────────────────────────────────
 
-MIC_LIST = get_microphones()
-
-# Chat height = 870px total
-#  - header+sub:   ~62px
-#  - status:       ~24px
-#  - mode radio:   ~38px
-#  - input row:    ~50px
-#  - voice panel:  ~100px (visible by default for Hybrid)
-#  - clear btn:    ~30px
-#  - gaps/padding: ~36px
-#  = dynamic, so controls at bottom stay visible even in Voice/Hybrid.
+MIC_LIST   = get_microphones()
 CHAT_HEIGHT = 260
 
-with gr.Blocks(
-    title="AIDA",
-    fill_height=False,
-    fill_width=True,
-    # NOTE: In Gradio 6.x css is passed to launch(), not Blocks()
-) as demo:
+PORT = 7860
+
+with gr.Blocks(title="AIDA", fill_height=False, fill_width=True) as demo:
 
     # ── Header ──────────────────────────────────────────────────────────────
     gr.HTML("""
@@ -622,18 +608,9 @@ with gr.Blocks(
             value=os.getenv("OPENAI_API_KEY", ""),
             placeholder="sk-...",
         )
-        mic_choice = gr.Dropdown(
-            choices=MIC_LIST,
-            value=MIC_LIST[0] if MIC_LIST else None,
-            label="Microphone",
-            interactive=True,
-        )
         save_settings_btn = gr.Button("Save settings", variant="secondary", size="sm")
         settings_status = gr.Textbox(
-            label="",
-            value="",
-            interactive=False,
-            lines=1,
+            label="", value="", interactive=False, lines=1,
             elem_classes=["aida-settings-status"],
         )
 
@@ -645,8 +622,9 @@ with gr.Blocks(
         layout="bubble",
         show_label=False,
         elem_classes=["aida-chat"],
-        avatar_images=(None, None),   # no avatars — keeps layout tight
+        avatar_images=(None, None),
         autoscroll=True,
+        type="messages",
     )
 
     # ── Input ────────────────────────────────────────────────────────────────
@@ -660,37 +638,31 @@ with gr.Blocks(
             lines=1,
             max_lines=1,
         )
-        send_btn = gr.Button(
-            "▶",
-            scale=1,
-            variant="secondary",
-            size="sm",
-            elem_classes=["aida-send"],
-        )
+        send_btn = gr.Button("▶", scale=1, variant="secondary", size="sm",
+                             elem_classes=["aida-send"])
 
-    # ── Voice panel (hidden in Text mode) ────────────────────────────────────
+    # ── Voice panel ───────────────────────────────────────────────────────────
     with gr.Group(visible=True, elem_classes=["aida-voice-panel"]) as voice_group:
-        gr.Markdown("Voice mode: choose mic and press TALK.")
-        record_seconds = gr.Slider(
-            minimum=2,
-            maximum=8,
-            step=1,
-            value=4,
-            label="Record duration (sec)",
-        )
+        gr.Markdown("**Voice mode** — press TALK (VAD: auto-stops on silence).")
         with gr.Row(equal_height=True):
-            talk_btn = gr.Button("🎤 TALK", variant="secondary", size="sm")
-            mic_muted = gr.Checkbox(label="Mute mic", value=False)
-        voice_state = gr.Textbox(label="Voice status", value="Idle", interactive=False, lines=1)
-        last_transcript = gr.Textbox(label="Last transcript", value="", interactive=False, lines=2)
+            talk_btn   = gr.Button("🎤 TALK", variant="secondary", size="sm")
+            mic_muted  = gr.Checkbox(label="Mute mic", value=False)
+        voice_state = gr.Textbox(label="Voice status", value="Idle",
+                                 interactive=False, lines=1)
+
+        gr.Markdown("**Wake Word mode** — say *'Aida'* to trigger automatically.")
+        wake_btn        = gr.Button("🔊 Wake Word ON", variant="secondary", size="sm",
+                                    elem_classes=["wake-btn"])
+        wake_status_txt = gr.Textbox(label="", value="Inactive",
+                                     interactive=False, lines=1,
+                                     elem_classes=["hide-label"])
 
     # ── Clear ────────────────────────────────────────────────────────────────
-    clear_btn = gr.Button(
-        "CLEAR CONVERSATION",
-        variant="secondary",
-        size="sm",
-        elem_classes=["aida-clear"],
-    )
+    clear_btn = gr.Button("CLEAR CONVERSATION", variant="secondary", size="sm",
+                          elem_classes=["aida-clear"])
+
+    # ── Timer: polls WAKE_EVENTS every 500 ms ─────────────────────────────────
+    timer = gr.Timer(0.5)
 
     # ── Wiring ───────────────────────────────────────────────────────────────
 
@@ -704,8 +676,20 @@ with gr.Blocks(
 
     talk_btn.click(
         fn=handle_voice_capture,
-        inputs=[chatbox, mode, mic_choice, mic_muted, record_seconds],
-        outputs=[chatbox, voice_state, last_transcript, core_view],
+        inputs=[chatbox, mode, mic_muted],
+        outputs=[chatbox, voice_state, core_view],
+    )
+
+    wake_btn.click(
+        fn=toggle_wake_word,
+        inputs=[wake_btn],
+        outputs=[wake_btn, wake_status_txt],
+    )
+
+    timer.tick(
+        fn=poll_wake_events,
+        inputs=[chatbox],
+        outputs=[chatbox],
     )
 
     clear_btn.click(fn=clear_chat, outputs=[chatbox])
@@ -718,16 +702,12 @@ with gr.Blocks(
 
     save_settings_btn.click(
         fn=save_settings,
-        inputs=[gemini_key, openai_key, mic_choice],
+        inputs=[gemini_key, openai_key],
         outputs=[status_md, settings_status],
     )
 
 
-
-# ─── Launch ── native window (pywebview) or browser fallback ─────────────────
-
-PORT = 7860
-
+# ── Launch ─────────────────────────────────────────────────────────────────────
 
 def _start_gradio():
     demo.queue().launch(
@@ -737,7 +717,7 @@ def _start_gradio():
         show_error=True,
         quiet=True,
         inbrowser=False,
-        css=CSS,               # Gradio 6.x: css belongs in launch(), not Blocks()
+        css=CSS,
     )
 
 
@@ -749,9 +729,7 @@ if __name__ == "__main__":
 
         t = threading.Thread(target=_start_gradio, daemon=True)
         t.start()
-
-        import time
-        time.sleep(2)   # wait for Gradio to bind
+        time.sleep(2)
 
         log.info("Opening native window (430×900)...")
         webview.create_window(
@@ -759,7 +737,7 @@ if __name__ == "__main__":
             url=f"http://127.0.0.1:{PORT}",
             width=430,
             height=900,
-            resizable=False,        # fixed size — layout is tuned for this
+            resizable=False,
             min_size=(430, 900),
             frameless=False,
             on_top=False,
@@ -769,7 +747,6 @@ if __name__ == "__main__":
 
     except ImportError:
         log.warning("pywebview not installed — opening in browser instead.")
-        log.warning("Install: pip install pywebview")
         demo.queue().launch(
             server_name="0.0.0.0",
             server_port=PORT,

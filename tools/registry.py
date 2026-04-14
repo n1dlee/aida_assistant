@@ -43,6 +43,12 @@ class ToolRegistry:
         if any(w in lower for w in ["open", "run", "execute", "открой", "запусти"]):
             return await self._tools["system"].run(user_input)
 
+        if any(w in lower for w in [
+            "calendar", "event", "schedule", "add meeting", "list events",
+            "календарь", "событие", "расписание", "добавь встречу", "покажи события",
+        ]):
+            return await self._tools["calendar"].run(user_input)
+
         return None  # No tool matched; return LLM response as-is
 
     def list_tools(self) -> list[str]:

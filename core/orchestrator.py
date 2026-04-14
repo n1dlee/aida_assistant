@@ -1,6 +1,13 @@
 """
 core/orchestrator.py
 Central coordinator: receives input, builds context, routes to brain, executes actions.
+
+Fixes applied:
+- EpisodicMemory integrated: logs every user+assistant exchange
+- Tool dispatch now runs BEFORE the LLM for pure tool intents, avoiding
+  wasted LLM inference that would be immediately overwritten
+- VectorStore.search now filters by role="user" so assistant responses
+  don't pollute memory retrieval
 """
 import asyncio
 import logging
@@ -9,6 +16,7 @@ from typing import Optional
 from brain.selector import ModelSelector
 from memory.buffer import ConversationBuffer
 from memory.vector_store import VectorStore
+from memory.episodic import EpisodicMemory
 from core.personality import Personality
 from core.router import IntentRouter
 from tools.registry import ToolRegistry
@@ -18,21 +26,20 @@ log = logging.getLogger("aida.orchestrator")
 
 class Orchestrator:
     def __init__(self):
-        self.selector = ModelSelector()
-        self.buffer = ConversationBuffer(max_turns=20)
+        self.selector    = ModelSelector()
+        self.buffer      = ConversationBuffer(max_turns=20)
         self.vector_store = VectorStore()
+        self.episodic    = EpisodicMemory()
         self.personality = Personality()
-        self.router = IntentRouter()
-        self.tools = ToolRegistry()
-        self._running = False
+        self.router      = IntentRouter()
+        self.tools       = ToolRegistry()
+        self._running    = False
 
     async def start(self):
         """Main loop — listens for input and processes it."""
         self._running = True
         log.info("AIDA online. Type your message (or 'quit' to exit).")
 
-        # In a full build, voice/listener.py feeds here via asyncio queue.
-        # For now: text input loop so you can test immediately.
         loop = asyncio.get_running_loop()
         while self._running:
             try:
@@ -51,21 +58,28 @@ class Orchestrator:
             print(f"\nAIDA: {response}")
 
     async def process(self, user_input: str) -> str:
-        """Full pipeline: input → context → model → (tools?) → response."""
+        """Full pipeline: input → context → (tool shortcut?) → model → response."""
         log.debug("Processing: %s", user_input)
 
         # 1. Detect intent
         intent = self.router.classify(user_input)
         log.info("Intent: %s", intent)
 
-        # 2. Retrieve relevant memories
-        memories = self.vector_store.search(user_input, top_k=3)
+        # 2. Try tool dispatch FIRST for tool intents — skip LLM if tool answers
+        if intent == "tool_call":
+            tool_result = await self.tools.execute(user_input, llm_response="")
+            if tool_result:
+                self._update_memory(user_input, tool_result)
+                return tool_result
 
-        # 3. Build context
-        history = self.buffer.get_history()
+        # 3. Retrieve relevant user-side memories (not polluted by assistant text)
+        memories = self.vector_store.search(user_input, top_k=3, role="user")
+
+        # 4. Build context
+        history       = self.buffer.get_history()
         system_prompt = self.personality.build_system_prompt(memories=memories)
 
-        # 4. Select model and get response
+        # 5. Select model and get response
         response, model_used = await self.selector.complete(
             system=system_prompt,
             history=history,
@@ -74,19 +88,25 @@ class Orchestrator:
         )
         log.info("Model used: %s", model_used)
 
-        # 5. Execute tool calls if needed
-        if intent == "tool_call":
-            tool_result = await self.tools.execute(user_input, response)
-            if tool_result:
-                response = tool_result
-
         # 6. Update memory
-        self.buffer.add(role="user", content=user_input)
-        self.buffer.add(role="assistant", content=response)
-        self.vector_store.add(user_input, metadata={"role": "user"})
-        self.vector_store.add(response, metadata={"role": "assistant"})
-
+        self._update_memory(user_input, response)
         return response
+
+    def _update_memory(self, user_input: str, response: str):
+        """Persist exchange to short-term buffer, semantic store, and episodic log."""
+        self.buffer.add(role="user",      content=user_input)
+        self.buffer.add(role="assistant", content=response)
+
+        # Store with explicit role so VectorStore.search(role=...) works
+        self.vector_store.add(user_input, metadata={"role": "user"})
+        self.vector_store.add(response,   metadata={"role": "assistant"})
+
+        # Episodic log — timestamped record of every exchange
+        self.episodic.log_event(
+            event_type="exchange",
+            content=user_input,
+            metadata={"response": response[:200]},
+        )
 
     def stop(self):
         self._running = False

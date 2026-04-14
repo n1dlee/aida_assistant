@@ -33,7 +33,10 @@ app = FastAPI(title="AIDA API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://localhost:8000"],
+    allow_origins=os.getenv(
+        "AIDA_CORS_ORIGINS",
+        "http://localhost:5173,http://localhost:3000,http://localhost:8000",
+    ).split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
