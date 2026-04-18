@@ -4,5 +4,21 @@
     "type": "test",
     "content": "unit test event",
     "metadata": {}
+  },
+  {
+    "timestamp": "2026-04-17T21:46:42.915172",
+    "type": "exchange",
+    "content": "����, ��� ��?",
+    "metadata": {
+      "response": "I'm sorry, I don't understand that message. Could you please write it in a language I can understand?"
+    }
+  },
+  {
+    "timestamp": "2026-04-17T21:47:39.930466",
+    "type": "exchange",
+    "content": "Yeah, how are you doing?",
+    "metadata": {
+      "response": "I am functioning perfectly, thank you for asking. I am ready to assist you with whatever you need. How may I help you today?"
+    }
   }
 ]

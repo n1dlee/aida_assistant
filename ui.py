@@ -30,23 +30,69 @@ except ImportError:
     pass
 
 import gradio as gr
+import logging as _early_log
+_early_log.basicConfig(level=_early_log.DEBUG, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+_early_log.getLogger("aida.ui").info("Gradio version: %s", gr.__version__)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.orchestrator import Orchestrator
 from voice.listener import VoiceListener
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("aida.ui")
 
+# ── Global exception hook — catches ALL unhandled exceptions incl. module-level ──
+import traceback as _tb
+
+def _global_exc_hook(exc_type, exc_value, exc_traceback):
+    log.critical("=" * 60)
+    log.critical("UNHANDLED EXCEPTION — AIDA crashed during startup")
+    log.critical("=" * 60)
+    for line in _tb.format_exception(exc_type, exc_value, exc_traceback):
+        for subline in line.splitlines():
+            log.critical(subline)
+    log.critical("=" * 60)
+
+sys.excepthook = _global_exc_hook
+log.debug("Global exception hook installed.")
+
 if ELL_AVAILABLE and ell is not None:
+    log.debug("Initialising ell...")
     ell.init(store="./data/ell_store", autocommit=True, verbose=False)
+    log.debug("ell OK.")
 
 # ── Shared state ─────────────────────────────────────────────────────────────
-orchestrator  = Orchestrator()
-voice_listener = VoiceListener()
+log.info("Creating Orchestrator...")
+try:
+    orchestrator = Orchestrator()
+    log.info("Orchestrator OK.")
+except Exception as _e:
+    log.critical("Orchestrator failed: %s", _e, exc_info=True)
+    raise
+
+# VoiceListener is initialised LAZILY on first voice use.
+# WhisperModel (CTranslate2) can crash at C level if onnxruntime/AVX is missing —
+# a module-level crash would kill the whole app before the UI ever opens.
+voice_listener: "VoiceListener | None" = None
+_voice_init_done = False
+
+def _get_voice_listener() -> "VoiceListener | None":
+    """Thread-safe lazy init: creates VoiceListener exactly once on first call."""
+    global voice_listener, _voice_init_done
+    if _voice_init_done:
+        return voice_listener
+    _voice_init_done = True
+    log.info("Initialising VoiceListener (first voice use)...")
+    try:
+        voice_listener = VoiceListener()
+        log.info("VoiceListener ready (available=%s).", voice_listener.is_available())
+    except Exception as _e:
+        log.error("VoiceListener init failed: %s", _e, exc_info=True)
+        voice_listener = None
+    return voice_listener
 
 # Queue: wake-word thread puts (transcript, response) here; UI polls it
 WAKE_EVENTS: "queue.Queue[tuple]" = queue.Queue()
@@ -132,13 +178,24 @@ def speak_text(text: str) -> None:
         log.debug("TTS skipped: %s", e)
 
 
-# ── Message helpers ──────────────────────────────────────────────────────────
+# ── History helpers — Gradio 6.x messages format ─────────────────────────────
+# Gradio 6.x dropped the type= parameter from gr.Chatbot but requires
+# {"role": "user"/"assistant", "content": str} dicts — tuples [[u,b]] no longer work.
 
-def make_user_msg(text: str) -> dict:
-    return {"role": "user", "content": text}
+def _append_exchange(history: list, user_text: str, bot_text: str) -> list:
+    """Append a complete user+bot pair."""
+    return history + [
+        {"role": "user",      "content": user_text},
+        {"role": "assistant", "content": bot_text},
+    ]
 
-def make_aida_msg(text: str) -> dict:
-    return {"role": "assistant", "content": text}
+def _append_user(history: list, user_text: str) -> list:
+    """Append a user message only (assistant reply comes next yield)."""
+    return history + [{"role": "user", "content": user_text}]
+
+def _append_bot(history: list, bot_text: str) -> list:
+    """Append an assistant reply."""
+    return history + [{"role": "assistant", "content": bot_text}]
 
 
 # ── Wake Word background thread ──────────────────────────────────────────────
@@ -155,7 +212,8 @@ def _wake_word_loop():
     global WAKE_RUNNING
     log.info("Wake word thread started.")
 
-    if not voice_listener.is_available():
+    _vl = _get_voice_listener()
+    if not _vl or not _vl.is_available():
         log.warning("VoiceListener not available — wake word thread exiting.")
         WAKE_RUNNING = False
         return
@@ -163,7 +221,7 @@ def _wake_word_loop():
     while WAKE_RUNNING:
         try:
             transcript = _run_async(
-                voice_listener.listen_with_wake_word(
+                _vl.listen_with_wake_word(
                     wake_keywords=["aida", "аида", "aide", "айда"]
                 )
             )
@@ -191,7 +249,8 @@ def start_wake_word() -> tuple[str, str]:
     global WAKE_RUNNING, WAKE_THREAD
     if WAKE_RUNNING:
         return "🔴 Wake Word OFF", "⚠ Already running"
-    if not voice_listener.is_available():
+    _vl = _get_voice_listener()
+    if not _vl or not _vl.is_available():
         return "🔊 Wake Word ON", "⚠ faster-whisper not installed"
     WAKE_RUNNING = True
     WAKE_THREAD  = threading.Thread(target=_wake_word_loop, daemon=True, name="WakeWord")
@@ -218,8 +277,7 @@ def poll_wake_events(history: list) -> list:
     try:
         while True:
             transcript, response = WAKE_EVENTS.get_nowait()
-            updated.append(make_user_msg(f"🎙️ {transcript}"))
-            updated.append(make_aida_msg(response))
+            updated = _append_exchange(updated, f"🎙️ {transcript}", response)
     except queue.Empty:
         pass
     return updated
@@ -231,37 +289,61 @@ def handle_text(user_message: str, history: list, mode: str):
     if not user_message.strip():
         yield history, "", core_markup(False)
         return
-    history = history + [make_user_msg(user_message)]
+    history = _append_user(history, user_message)
     yield history, "", core_markup(False)
     response = _run_async(orchestrator.process(user_message))
-    history  = history + [make_aida_msg(response)]
+    history = _append_bot(history, response)
     yield history, "", core_markup(True)
 
 
 def handle_voice_capture(history: list, mode: str, muted: bool):
     """
-    TALK button handler — uses VAD-based recording (no fixed timer).
-    Stops automatically when silence > AIDA_SILENCE_TIMEOUT seconds.
+    TALK button handler.
+    Runs recording + transcription in a SEPARATE SUBPROCESS so that
+    CTranslate2/faster-whisper C-level crashes cannot kill the main app.
     """
     if mode != "Voice":
         return history, "Voice mode is disabled.", core_markup(False)
     if muted:
-        history = history + [make_aida_msg("🔇 Microphone muted. Unmute to speak.")]
+        history = _append_exchange(history, "🔇 [muted]", "Microphone muted. Unmute to speak.")
         return history, "Muted.", core_markup(False)
-    if not voice_listener.is_available():
-        return history, "⚠ faster-whisper not installed.", core_markup(False)
+
+    import subprocess
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice", "voice_worker.py")
+
+    if not os.path.exists(worker):
+        return history, "⚠ voice_worker.py not found.", core_markup(False)
 
     try:
-        transcript = _run_async(voice_listener.listen())
-        history    = history + [make_user_msg(f"🎤 {transcript}")]
-        if not transcript.strip():
+        log.info("Spawning voice_worker subprocess...")
+        result = subprocess.run(
+            [sys.executable, worker],
+            capture_output=True,
+            timeout=120,
+        )
+        stderr_txt = result.stderr.decode("utf-8", errors="replace").strip()
+        if result.returncode != 0:
+            err = stderr_txt or "voice_worker exited with non-zero code"
+            log.error("voice_worker failed: %s", err)
+            history = _append_exchange(history, "🎤 [error]", f"Voice error: {err}")
+            return history, f"Voice error: {err}", core_markup(False)
+
+        transcript = result.stdout.decode("utf-8", errors="replace").strip()
+        log.info("voice_worker transcript: %r", transcript)
+
+        if not transcript:
             return history, "Nothing heard.", core_markup(False)
-        response   = _run_async(orchestrator.process(transcript))
-        history    = history + [make_aida_msg(response)]
+
+        history  = _append_user(history, f"🎤 {transcript}")
+        response = _run_async(orchestrator.process(transcript))
+        history  = _append_bot(history, response)
         return history, "✅ Done.", core_markup(True)
-    except Exception as e:
-        history = history + [make_aida_msg(f"[Voice error: {e}]")]
-        return history, f"Error: {e}", core_markup(False)
+
+    except subprocess.TimeoutExpired:
+        return history, "⚠ Voice recording timed out.", core_markup(False)
+    except Exception as exc:
+        log.error("handle_voice_capture error: %s", exc, exc_info=True)
+        return history, f"Voice error: {exc}", core_markup(False)
 
 
 def clear_chat():
@@ -271,12 +353,10 @@ def clear_chat():
 
 def toggle_voice_ui(m: str):
     show = m == "Voice"
-    text_enabled = m != "Voice"
     chat_h = 150 if show else 320
     return (
-        gr.update(visible=show),
-        gr.update(visible=text_enabled),
-        gr.update(height=chat_h, min_height=chat_h),
+        gr.update(visible=show),                       # voice_group
+        gr.update(height=chat_h, min_height=chat_h),  # chatbox
     )
 
 
@@ -567,12 +647,15 @@ footer { display: none !important; }
 
 # ── UI layout ─────────────────────────────────────────────────────────────────
 
+log.info("Querying microphones...")
 MIC_LIST   = get_microphones()
-CHAT_HEIGHT = 260
+log.info("Microphones: %s", MIC_LIST)
+CHAT_HEIGHT = 150
 
 PORT = 7860
 
-with gr.Blocks(title="AIDA", fill_height=False, fill_width=True) as demo:
+log.info("Building Gradio UI (gr.Blocks)...")
+with gr.Blocks(title="AIDA", fill_width=True) as demo:
 
     # ── Header ──────────────────────────────────────────────────────────────
     gr.HTML("""
@@ -619,12 +702,9 @@ with gr.Blocks(title="AIDA", fill_height=False, fill_width=True) as demo:
         label="",
         height=CHAT_HEIGHT,
         min_height=CHAT_HEIGHT,
-        layout="bubble",
         show_label=False,
         elem_classes=["aida-chat"],
         avatar_images=(None, None),
-        autoscroll=True,
-        type="messages",
     )
 
     # ── Input ────────────────────────────────────────────────────────────────
@@ -697,7 +777,7 @@ with gr.Blocks(title="AIDA", fill_height=False, fill_width=True) as demo:
     mode.change(
         fn=toggle_voice_ui,
         inputs=mode,
-        outputs=[voice_group, text_row, chatbox],
+        outputs=[voice_group, chatbox],
     )
 
     save_settings_btn.click(
@@ -706,52 +786,83 @@ with gr.Blocks(title="AIDA", fill_height=False, fill_width=True) as demo:
         outputs=[status_md, settings_status],
     )
 
+log.info("Gradio UI built successfully.")
+
 
 # ── Launch ─────────────────────────────────────────────────────────────────────
 
 def _start_gradio():
-    demo.queue().launch(
-        server_name="127.0.0.1",
-        server_port=PORT,
-        prevent_thread_lock=True,
-        show_error=True,
-        quiet=True,
-        inbrowser=False,
-        css=CSS,
-    )
+    log.info("Gradio server thread starting on 127.0.0.1:%d ...", PORT)
+    try:
+        demo.queue().launch(
+            server_name="127.0.0.1",
+            server_port=PORT,
+            prevent_thread_lock=True,
+            show_error=True,
+            quiet=False,
+            inbrowser=False,
+            css=CSS,
+        )
+        log.info("Gradio server launched (non-blocking).")
+    except Exception as _e:
+        log.critical("Gradio launch() FAILED: %s", _e, exc_info=True)
 
 
 if __name__ == "__main__":
-    log.info("Starting AIDA...")
+    log.info("=" * 50)
+    log.info("AIDA __main__ reached — startup proceeding.")
+    log.info("Python %s | Platform: %s", sys.version.split()[0], sys.platform)
+    log.info("Gradio version: %s", gr.__version__)
+    log.info("=" * 50)
 
+    log.info("Attempting to import pywebview...")
     try:
         import webview  # pywebview ≥ 4.x
+        log.info("pywebview found (version: %s). Using native window.", getattr(webview, '__version__', '?'))
 
+        log.info("Starting Gradio server thread...")
         t = threading.Thread(target=_start_gradio, daemon=True)
         t.start()
+        log.info("Waiting 2s for Gradio to bind to port %d...", PORT)
         time.sleep(2)
 
-        log.info("Opening native window (430×900)...")
-        webview.create_window(
-            title="AIDA",
-            url=f"http://127.0.0.1:{PORT}",
-            width=430,
-            height=900,
-            resizable=False,
-            min_size=(430, 900),
-            frameless=False,
-            on_top=False,
-            background_color="#0a0c0f",
-        )
-        webview.start(debug=False)
+        log.info("Opening native window 430×900 at http://127.0.0.1:%d", PORT)
+        try:
+            webview.create_window(
+                title="AIDA",
+                url=f"http://127.0.0.1:{PORT}",
+                width=430,
+                height=900,
+                resizable=False,
+                background_color="#0a0c0f",
+            )
+            log.info("webview.create_window() OK. Calling webview.start()...")
+            webview.start(debug=False)
+            log.info("webview.start() returned — window closed.")
+        except Exception as _wv_err:
+            log.critical("pywebview error: %s", _wv_err, exc_info=True)
+            log.warning("Falling back to browser launch...")
+            demo.queue().launch(
+                server_name="0.0.0.0",
+                server_port=PORT,
+                inbrowser=True,
+                show_error=True,
+                quiet=False,
+                css=CSS,
+            )
 
     except ImportError:
-        log.warning("pywebview not installed — opening in browser instead.")
-        demo.queue().launch(
-            server_name="0.0.0.0",
-            server_port=PORT,
-            inbrowser=True,
-            show_error=True,
-            quiet=False,
-            css=CSS,
-        )
+        log.warning("pywebview not installed — launching in browser instead.")
+        log.info("Calling demo.queue().launch() on 0.0.0.0:%d ...", PORT)
+        try:
+            demo.queue().launch(
+                server_name="0.0.0.0",
+                server_port=PORT,
+                inbrowser=True,
+                show_error=True,
+                quiet=False,
+                css=CSS,
+            )
+        except Exception as _launch_err:
+            log.critical("demo.launch() FAILED: %s", _launch_err, exc_info=True)
+            raise

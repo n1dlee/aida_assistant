@@ -48,13 +48,30 @@ class VoiceListener:
     def _init(self):
         try:
             from faster_whisper import WhisperModel
-            self._model     = WhisperModel(self.model_size, device="cpu", compute_type="int8")
-            self._available = True
-            log.info("Whisper loaded (model: %s).", self.model_size)
         except ImportError:
             log.warning("faster-whisper not installed — voice input disabled.")
-        except Exception as e:
-            log.warning("Whisper init failed: %s", e)
+            return
+
+        # Try compute types from most efficient to most compatible.
+        # CTranslate2 can crash at C level (not a Python exception) if the CPU
+        # doesn't support int8 or onnxruntime is missing, so we try fallbacks.
+        compute_types = ["int8", "float32", "auto"]
+        last_err = None
+        for ct in compute_types:
+            try:
+                log.debug("Trying WhisperModel compute_type=%s ...", ct)
+                self._model     = WhisperModel(self.model_size, device="cpu", compute_type=ct)
+                self._available = True
+                log.info("Whisper loaded (model=%s, compute_type=%s).", self.model_size, ct)
+                return
+            except Exception as e:
+                log.warning("WhisperModel(compute_type=%s) failed: %s", ct, e)
+                last_err = e
+
+        log.warning(
+            "All compute_type options failed — voice disabled. "
+            "Try: pip install onnxruntime  (last error: %s)", last_err
+        )
 
     def is_available(self) -> bool:
         return self._available

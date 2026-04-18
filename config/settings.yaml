@@ -8,7 +8,7 @@ aida:
   log_level: "INFO"
 
 brain:
-  local_model: "gemma4:e2b"        # Ollama model name
+  local_model: "gemma4:31b"       # Ollama model name
   cloud_provider: "gemini"           # "gemini" or "openai"
   cloud_model_gemini: "gemini-2.0-flash"
   cloud_model_openai: "gpt-4o-mini"
