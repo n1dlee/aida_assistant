@@ -10,6 +10,7 @@ from tools.system_tool import SystemTool
 from tools.web_tool import WebTool
 from tools.calendar_tool import CalendarTool
 from tools.time_tool import TimeTool
+from tools.filesystem_tool import FilesystemTool
 
 log = logging.getLogger("aida.tools.registry")
 
@@ -20,7 +21,7 @@ class ToolRegistry:
         self._register_defaults()
 
     def _register_defaults(self):
-        for tool in [SystemTool(), WebTool(), CalendarTool(), TimeTool()]:
+        for tool in [SystemTool(), WebTool(), CalendarTool(), TimeTool(), FilesystemTool()]:
             self.register(tool)
 
     def register(self, tool: BaseTool):
@@ -48,6 +49,18 @@ class ToolRegistry:
             "календарь", "событие", "расписание", "добавь встречу", "покажи события",
         ]):
             return await self._tools["calendar"].run(user_input)
+
+
+        if any(w in lower for w in [
+            "create folder","make folder","new folder","mkdir","create directory",
+            "delete folder","remove folder","delete file","remove file",
+            "list files","show files","what's in","contents of",
+            "read file","open file","write file","save file","create file",
+            "rename","переименуй",
+            "создай папку","удали папку","удали файл","список файлов",
+            "прочитай файл","создай файл","запиши в файл",
+        ]):
+            return await self._tools["filesystem"].run(user_input)
 
         return None  # No tool matched; return LLM response as-is
 

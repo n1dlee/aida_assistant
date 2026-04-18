@@ -11,9 +11,11 @@ Wake Word режим:
 """
 
 import asyncio
+import json
 import logging
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -127,8 +129,8 @@ def _run_async(coro):
 def get_microphones() -> list[str]:
     try:
         import sounddevice as sd
-        devices   = sd.query_devices()
-        default_in, _ = sd.default.device
+        devices    = sd.query_devices()
+        default_in = sd.default.device[0]
         seen: set[str] = set()
         mics: list[str] = []
         if isinstance(default_in, int) and default_in >= 0:
@@ -136,7 +138,7 @@ def get_microphones() -> list[str]:
             if d0.get("max_input_channels", 0) > 0:
                 name0 = str(d0["name"]).strip()
                 seen.add(name0.lower())
-                mics.append(f"{default_in}: {name0}")
+                mics.append(f"{default_in}: {name0} [Default]")
         for i, dev in enumerate(devices):
             d: dict = dev  # type: ignore[assignment]
             if d.get("max_input_channels", 0) <= 0:
@@ -146,7 +148,7 @@ def get_microphones() -> list[str]:
                 continue
             seen.add(name.lower())
             mics.append(f"{i}: {name}")
-            if len(mics) >= 5:
+            if len(mics) >= 10:
                 break
         return mics if mics else ["Default microphone"]
     except Exception:
@@ -178,6 +180,131 @@ def speak_text(text: str) -> None:
         log.debug("TTS skipped: %s", e)
 
 
+# ── TTS / device helpers ─────────────────────────────────────────────────────
+
+_TTS_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "voice", "tts_worker.py")
+
+def _get_device_index(mic_str: str):
+    """Extract integer device index from '7: Mic Name [Default]' → 7, or None."""
+    try:
+        return int(mic_str.split(":")[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _speak_async(text: str) -> None:
+    """Spawn TTS worker in background thread — non-blocking, runs while UI updates."""
+    import threading
+    def _run():
+        try:
+            subprocess.run(
+                [sys.executable, _TTS_WORKER],
+                input=text.encode("utf-8", errors="replace"),
+                capture_output=True,
+                timeout=90,
+            )
+        except Exception as exc:
+            log.debug("TTS async error: %s", exc)
+    threading.Thread(target=_run, daemon=True, name="TTS").start()
+
+
+def _speak_sync(text: str) -> None:
+    """Blocking TTS — used in wake word loop (listen→speak→listen)."""
+    try:
+        subprocess.run(
+            [sys.executable, _TTS_WORKER],
+            input=text.encode("utf-8", errors="replace"),
+            capture_output=True,
+            timeout=90,
+        )
+    except Exception as exc:
+        log.debug("TTS sync error: %s", exc)
+
+
+# ── Persistent transcription server ──────────────────────────────────────────
+# Loads WhisperModel ONCE on startup. Each TALK call costs only inference
+# time (~1-3 s on CUDA) instead of model-load time (20-50 s/spawn).
+
+_TRANS_PROC: "subprocess.Popen[bytes] | None" = None
+_TRANS_LOCK  = threading.Lock()
+_TRANS_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "voice", "transcription_server.py"
+)
+
+
+def _ensure_transcription_server() -> "subprocess.Popen[bytes] | None":
+    global _TRANS_PROC
+    if _TRANS_PROC and _TRANS_PROC.poll() is None:
+        return _TRANS_PROC
+
+    if not os.path.exists(_TRANS_SCRIPT):
+        log.error("transcription_server.py not found")
+        return None
+
+    log.info("Starting transcription server …")
+    try:
+        _TRANS_PROC = subprocess.Popen(
+            [sys.executable, _TRANS_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+    except Exception as exc:
+        log.error("Cannot spawn transcription server: %s", exc)
+        return None
+
+    # Drain stderr in background so it doesn't block
+    def _log_stderr():
+        proc = _TRANS_PROC
+        if proc and proc.stderr:
+            for line in proc.stderr:
+                log.debug("[trans-srv] %s", line.decode(errors="replace").rstrip())
+    threading.Thread(target=_log_stderr, daemon=True, name="TransSrvStderr").start()
+
+    # Wait for "READY" signal (model load can take up to 90 s first time)
+    ready_q: queue.Queue = queue.Queue()
+    def _wait_ready():
+        if _TRANS_PROC and _TRANS_PROC.stdout:
+            ready_q.put(_TRANS_PROC.stdout.readline())
+    threading.Thread(target=_wait_ready, daemon=True, name="TransSrvReady").start()
+    try:
+        line = ready_q.get(timeout=120)
+        if b"READY" not in line:
+            raise RuntimeError(f"unexpected startup line: {line!r}")
+        log.info("Transcription server READY.")
+        return _TRANS_PROC
+    except Exception as exc:
+        log.error("Transcription server failed to start: %s", exc)
+        _TRANS_PROC.kill()
+        return None
+
+
+def transcribe_audio_file(wav_path: str, lang: str | None = None) -> tuple[str, str]:
+    """Send WAV path to persistent server → (transcript, detected_lang)."""
+    with _TRANS_LOCK:
+        proc = _ensure_transcription_server()
+        if not proc:
+            return "", "en"
+        try:
+            req = json.dumps({"path": wav_path, "lang": lang or "auto"}) + "\n"
+            proc.stdin.write(req.encode())   # type: ignore[union-attr]
+            proc.stdin.flush()               # type: ignore[union-attr]
+            resp = proc.stdout.readline()    # type: ignore[union-attr]
+            data = json.loads(resp.decode().strip())
+            return data.get("text", ""), data.get("lang", "en")
+        except Exception as exc:
+            log.error("transcribe_audio_file error: %s", exc)
+            return "", "en"
+
+
+def _preload_transcription_server() -> None:
+    """Called once at startup — pre-warms the model so first TALK is fast."""
+    threading.Thread(target=_ensure_transcription_server,
+                     daemon=True, name="TransServerLoader").start()
+
+
 # ── History helpers — Gradio 6.x messages format ─────────────────────────────
 # Gradio 6.x dropped the type= parameter from gr.Chatbot but requires
 # {"role": "user"/"assistant", "content": str} dicts — tuples [[u,b]] no longer work.
@@ -199,47 +326,82 @@ def _append_bot(history: list, bot_text: str) -> list:
 
 
 # ── Wake Word background thread ──────────────────────────────────────────────
+# Uses a long-running subprocess (wake_listener.py) that:
+#   1. Loads WhisperModel ONCE (amortises startup cost)
+#   2. Records 3-second chunks and checks for wake keywords
+#   3. On match: records command (VAD), sends JSON line to stdout
+#   4. Main thread reads stdout and dispatches to orchestrator
+#
+# Because the subprocess is isolated, CTranslate2 crashes won't kill the app.
 
-def _wake_word_loop():
-    """
-    Runs in a daemon thread.
-    1. Waits for "Aida / Аида" via Whisper-based keyword spotting (VoiceListener).
-    2. Records the following utterance with VAD (stops on silence).
-    3. Sends to orchestrator.
-    4. Puts (transcript, response) into WAKE_EVENTS queue for UI polling.
-    5. Optionally speaks the response via TTS.
-    """
-    global WAKE_RUNNING
+_WAKE_PROC: "subprocess.Popen[bytes] | None" = None
+
+
+def _wake_word_loop() -> None:
+    """Daemon thread: manages the wake_listener subprocess lifecycle."""
+    global WAKE_RUNNING, _WAKE_PROC
+
     log.info("Wake word thread started.")
-
-    _vl = _get_voice_listener()
-    if not _vl or not _vl.is_available():
-        log.warning("VoiceListener not available — wake word thread exiting.")
+    listener_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "voice", "wake_listener.py",
+    )
+    if not os.path.exists(listener_script):
+        log.error("wake_listener.py not found — wake word disabled.")
         WAKE_RUNNING = False
         return
 
     while WAKE_RUNNING:
+        # ── build command ────────────────────────────────────────────────────
+        cmd = [sys.executable, listener_script]
+        dev_idx = _get_device_index(MIC_LIST[0]) if MIC_LIST else None
+        if dev_idx is not None:
+            cmd += ["--device", str(dev_idx)]
+        if WAKE_LANG not in (None, "auto", ""):
+            cmd += ["--lang", WAKE_LANG]
+
+        log.info("Spawning wake_listener: %s", " ".join(str(c) for c in cmd))
+
         try:
-            transcript = _run_async(
-                _vl.listen_with_wake_word(
-                    wake_keywords=["aida", "аида", "aide", "айда"]
-                )
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=1,              # line-buffered
             )
-            if not transcript.strip():
-                continue
+            _WAKE_PROC = proc
 
-            log.info("Wake utterance: %r", transcript)
-            response = _run_async(orchestrator.process(transcript))
-            WAKE_EVENTS.put((transcript, response))
+            # ── read JSON lines from subprocess stdout ────────────────────
+            while WAKE_RUNNING and proc.poll() is None:
+                raw = proc.stdout.readline()  # type: ignore[union-attr]
+                if not raw:
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    data       = json.loads(line)
+                    transcript = data.get("transcript", "").strip()
+                    if transcript:
+                        log.info("Wake command: %r", transcript)
+                        response = _run_async(orchestrator.process(transcript))
+                        WAKE_EVENTS.put((transcript, response))
+                        _speak_sync(response)
+                except json.JSONDecodeError:
+                    log.debug("wake_listener non-JSON: %r", line)
 
-            # Optional TTS output
-            if os.getenv("AIDA_WAKE_TTS", "1") == "1":
-                speak_text(response)
+            ret = proc.poll()
+            if ret is not None and ret != 0:
+                log.warning("wake_listener exited (code=%d) — restarting in 2 s", ret)
+                time.sleep(2)
 
         except Exception as exc:
-            if WAKE_RUNNING:
-                log.error("Wake word loop error: %s", exc)
-                time.sleep(1)   # brief pause before retrying
+            log.error("Wake word loop error: %s", exc)
+            time.sleep(2)
+        finally:
+            if _WAKE_PROC and _WAKE_PROC.poll() is None:
+                _WAKE_PROC.terminate()
+            _WAKE_PROC = None
 
     log.info("Wake word thread stopped.")
 
@@ -249,19 +411,22 @@ def start_wake_word() -> tuple[str, str]:
     global WAKE_RUNNING, WAKE_THREAD
     if WAKE_RUNNING:
         return "🔴 Wake Word OFF", "⚠ Already running"
-    _vl = _get_voice_listener()
-    if not _vl or not _vl.is_available():
-        return "🔊 Wake Word ON", "⚠ faster-whisper not installed"
+    listener = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "voice", "wake_listener.py")
+    if not os.path.exists(listener):
+        return "🔊 Wake Word ON", "⚠ wake_listener.py not found"
     WAKE_RUNNING = True
     WAKE_THREAD  = threading.Thread(target=_wake_word_loop, daemon=True, name="WakeWord")
     WAKE_THREAD.start()
-    return "🔴 Wake Word OFF", "✅ Wake word listening active — say 'Aida'"
+    return "🔴 Wake Word OFF", "✅ Listening — say 'Aida / Jarvis / Assistant …'"
 
 
 def stop_wake_word() -> tuple[str, str]:
-    """Stop the background wake word detection thread."""
-    global WAKE_RUNNING
+    """Stop the background wake word detection thread and kill subprocess."""
+    global WAKE_RUNNING, _WAKE_PROC
     WAKE_RUNNING = False
+    if _WAKE_PROC and _WAKE_PROC.poll() is None:
+        _WAKE_PROC.terminate()
     return "🔊 Wake Word ON", "⏹ Wake word stopped"
 
 
@@ -293,14 +458,18 @@ def handle_text(user_message: str, history: list, mode: str):
     yield history, "", core_markup(False)
     response = _run_async(orchestrator.process(user_message))
     history = _append_bot(history, response)
+    _speak_async(response)          # ← automatic voice output (non-blocking)
     yield history, "", core_markup(True)
 
 
-def handle_voice_capture(history: list, mode: str, muted: bool):
+def handle_voice_capture(history: list, mode: str, muted: bool,
+                          mic_choice: str = "Default microphone",
+                          lang_choice: str = "auto"):
     """
     TALK button handler.
-    Runs recording + transcription in a SEPARATE SUBPROCESS so that
-    CTranslate2/faster-whisper C-level crashes cannot kill the main app.
+    Step 1: voice_worker subprocess records audio (fast, no model load).
+    Step 2: persistent transcription_server transcribes (model always in GPU).
+    Total latency: ~2-5 s instead of 40-55 s.
     """
     if mode != "Voice":
         return history, "Voice mode is disabled.", core_markup(False)
@@ -308,35 +477,45 @@ def handle_voice_capture(history: list, mode: str, muted: bool):
         history = _append_exchange(history, "🔇 [muted]", "Microphone muted. Unmute to speak.")
         return history, "Muted.", core_markup(False)
 
-    import subprocess
-    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice", "voice_worker.py")
-
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "voice", "voice_worker.py")
     if not os.path.exists(worker):
         return history, "⚠ voice_worker.py not found.", core_markup(False)
 
+    # Build record-only subprocess command (no --lang needed here)
+    cmd = [sys.executable, worker, "--silence", "1.0"]
+    dev_idx = _get_device_index(mic_choice)
+    if dev_idx is not None:
+        cmd += ["--device", str(dev_idx)]
+
     try:
-        log.info("Spawning voice_worker subprocess...")
-        result = subprocess.run(
-            [sys.executable, worker],
-            capture_output=True,
-            timeout=120,
-        )
-        stderr_txt = result.stderr.decode("utf-8", errors="replace").strip()
-        if result.returncode != 0:
-            err = stderr_txt or "voice_worker exited with non-zero code"
-            log.error("voice_worker failed: %s", err)
-            history = _append_exchange(history, "🎤 [error]", f"Voice error: {err}")
-            return history, f"Voice error: {err}", core_markup(False)
+        # ── Step 1: record audio (fast, ~1-3 s) ─────────────────────────────
+        log.info("Recording: %s", " ".join(str(c) for c in cmd))
+        rec = subprocess.run(cmd, capture_output=True, timeout=60)
 
-        transcript = result.stdout.decode("utf-8", errors="replace").strip()
-        log.info("voice_worker transcript: %r", transcript)
+        if rec.returncode != 0:
+            err = rec.stderr.decode("utf-8", errors="replace").strip() or "recorder error"
+            log.error("voice_worker error: %s", err)
+            return history, f"Recording error: {err}", core_markup(False)
 
-        if not transcript:
+        wav_path = rec.stdout.decode("utf-8", errors="replace").strip()
+        if not wav_path or not os.path.exists(wav_path):
+            return history, "Nothing heard (no audio file).", core_markup(False)
+
+        # ── Step 2: transcribe via persistent server (~1-2 s on GPU) ────────
+        lang_arg = None if lang_choice in (None, "auto", "") else lang_choice
+        log.info("Transcribing %s lang=%s ...", wav_path, lang_arg)
+        transcript, _ = transcribe_audio_file(wav_path, lang_arg)
+        # wav_path deleted by server after transcription
+        log.info("Transcript: %r", transcript)
+
+        if not transcript.strip():
             return history, "Nothing heard.", core_markup(False)
 
         history  = _append_user(history, f"🎤 {transcript}")
         response = _run_async(orchestrator.process(transcript))
         history  = _append_bot(history, response)
+        _speak_async(response)
         return history, "✅ Done.", core_markup(True)
 
     except subprocess.TimeoutExpired:
@@ -650,6 +829,12 @@ footer { display: none !important; }
 log.info("Querying microphones...")
 MIC_LIST   = get_microphones()
 log.info("Microphones: %s", MIC_LIST)
+LANG_CHOICES = ["auto", "ru", "en"]
+LANG_DEFAULT = "auto"
+WAKE_LANG    = "auto"   # updated by UI language selector
+
+# Pre-warm transcription server in background
+_preload_transcription_server()
 CHAT_HEIGHT = 150
 
 PORT = 7860
@@ -724,6 +909,19 @@ with gr.Blocks(title="AIDA", fill_width=True) as demo:
     # ── Voice panel ───────────────────────────────────────────────────────────
     with gr.Group(visible=True, elem_classes=["aida-voice-panel"]) as voice_group:
         gr.Markdown("**Voice mode** — press TALK (VAD: auto-stops on silence).")
+        mic_device = gr.Dropdown(
+            choices=MIC_LIST,
+            value=MIC_LIST[0] if MIC_LIST else "Default microphone",
+            label="🎙 Microphone",
+            show_label=True,
+            interactive=True,
+            elem_classes=["aida-mic-select"],
+        )
+        lang_radio = gr.Radio(
+            choices=LANG_CHOICES, value=LANG_DEFAULT,
+            label="🌐 Language", interactive=True,
+            elem_classes=["aida-lang-radio"],
+        )
         with gr.Row(equal_height=True):
             talk_btn   = gr.Button("🎤 TALK", variant="secondary", size="sm")
             mic_muted  = gr.Checkbox(label="Mute mic", value=False)
@@ -756,9 +954,15 @@ with gr.Blocks(title="AIDA", fill_width=True) as demo:
 
     talk_btn.click(
         fn=handle_voice_capture,
-        inputs=[chatbox, mode, mic_muted],
+        inputs=[chatbox, mode, mic_muted, mic_device, lang_radio],
         outputs=[chatbox, voice_state, core_view],
     )
+
+    def _update_wake_lang(lang):
+        global WAKE_LANG
+        WAKE_LANG = lang
+        return lang
+    lang_radio.change(fn=_update_wake_lang, inputs=lang_radio, outputs=lang_radio)
 
     wake_btn.click(
         fn=toggle_wake_word,

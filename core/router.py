@@ -14,7 +14,8 @@ INTENT_PATTERNS = {
         r"\b(schedule|automate|watch for)\b",
     ],
     "tool_call": [
-        r"\b(open|run|execute|launch|search|find|create|delete|move|copy)\b",
+        r"\b(open|run|execute|launch|search|find|create|delete|move|copy|rename|list|read|write)\b",
+        r"\b(folder|directory|file|папка|файл|директория)\b",
         r"\b(set (alarm|timer|reminder))\b",
         r"\b(weather|time|date)\b",
         r"\b(play|pause|stop|volume)\b",
