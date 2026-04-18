@@ -125,6 +125,40 @@ def _run_async(coro):
     except RuntimeError:
         return asyncio.run(coro)
 
+def _stream_llm(user_input: str):
+    """
+    Bridge between sync Gradio generator and async orchestrator.stream_process.
+    Yields string tokens. Raises on error.
+    """
+    import queue as _q
+    token_q: "_q.Queue[object]" = _q.Queue()
+    _DONE = object()
+
+    async def _run():
+        try:
+            async for tok in orchestrator.stream_process(user_input):
+                token_q.put(tok)
+        except Exception as exc:
+            token_q.put(exc)
+        finally:
+            token_q.put(_DONE)
+
+    t = threading.Thread(target=lambda: asyncio.run(_run()), daemon=True, name="LLMStream")
+    t.start()
+    try:
+        while True:
+            item = token_q.get(timeout=120)
+            if item is _DONE:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield str(item)
+    finally:
+        t.join(timeout=2)
+
+
+
+
 
 def get_microphones() -> list[str]:
     try:
@@ -182,8 +216,10 @@ def speak_text(text: str) -> None:
 
 # ── TTS / device helpers ─────────────────────────────────────────────────────
 
-_TTS_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+_TTS_WORKER  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "voice", "tts_worker.py")
+_TTS_SERVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "voice", "tts_server.py")
 
 def _get_device_index(mic_str: str):
     """Extract integer device index from '7: Mic Name [Default]' → 7, or None."""
@@ -193,33 +229,93 @@ def _get_device_index(mic_str: str):
         return None
 
 
-def _speak_async(text: str) -> None:
-    """Spawn TTS worker in background thread — non-blocking, runs while UI updates."""
-    import threading
-    def _run():
+# ── Persistent TTS server ────────────────────────────────────────────────────
+_TTS_PROC: "subprocess.Popen[bytes] | None" = None
+_TTS_PROC_LOCK = threading.Lock()
+
+
+def _ensure_tts_server() -> "subprocess.Popen[bytes] | None":
+    global _TTS_PROC
+    if _TTS_PROC and _TTS_PROC.poll() is None:
+        return _TTS_PROC
+    if not os.path.exists(_TTS_SERVER_SCRIPT):
+        return None
+    log.info("Starting TTS server …")
+    try:
+        _TTS_PROC = subprocess.Popen(
+            [sys.executable, _TTS_SERVER_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        # drain stderr in background
+        def _log_stderr():
+            proc = _TTS_PROC
+            if proc and proc.stderr:
+                for line in proc.stderr:
+                    log.debug("[tts-srv] %s", line.decode(errors="replace").rstrip())
+        threading.Thread(target=_log_stderr, daemon=True, name="TTSSrvStderr").start()
+        # wait for READY
+        rq: queue.Queue = queue.Queue()
+        def _wait(): rq.put(_TTS_PROC.stdout.readline() if _TTS_PROC else b"")
+        threading.Thread(target=_wait, daemon=True).start()
         try:
-            subprocess.run(
-                [sys.executable, _TTS_WORKER],
-                input=text.encode("utf-8", errors="replace"),
-                capture_output=True,
-                timeout=90,
-            )
+            line = rq.get(timeout=120)
+            if b"READY" not in line:
+                raise RuntimeError(f"TTS server unexpected: {line!r}")
+            log.info("TTS server READY.")
         except Exception as exc:
-            log.debug("TTS async error: %s", exc)
+            log.warning("TTS server not ready: %s — falling back to tts_worker", exc)
+            if _TTS_PROC: _TTS_PROC.kill()
+            _TTS_PROC = None
+        return _TTS_PROC
+    except Exception as exc:
+        log.error("Cannot start TTS server: %s", exc)
+        return None
+
+
+def _preload_tts_server() -> None:
+    threading.Thread(target=_ensure_tts_server, daemon=True, name="TTSServerLoader").start()
+
+
+def _speak_via_server(text: str) -> bool:
+    """Send text to persistent TTS server. Returns True on success."""
+    with _TTS_PROC_LOCK:
+        proc = _ensure_tts_server()
+        if not proc:
+            return False
+        try:
+            proc.stdin.write((text.replace("\n", " ") + "\n").encode("utf-8", errors="replace"))
+            proc.stdin.flush()
+            return True
+        except Exception as exc:
+            log.debug("TTS server write error: %s", exc)
+            return False
+
+
+def _speak_async(text: str) -> None:
+    """Non-blocking TTS — uses persistent server, falls back to subprocess."""
+    def _run():
+        if not _speak_via_server(text):
+            try:
+                subprocess.run([sys.executable, _TTS_WORKER],
+                               input=text.encode("utf-8", errors="replace"),
+                               capture_output=True, timeout=90)
+            except Exception as exc:
+                log.debug("TTS fallback error: %s", exc)
     threading.Thread(target=_run, daemon=True, name="TTS").start()
 
 
 def _speak_sync(text: str) -> None:
-    """Blocking TTS — used in wake word loop (listen→speak→listen)."""
-    try:
-        subprocess.run(
-            [sys.executable, _TTS_WORKER],
-            input=text.encode("utf-8", errors="replace"),
-            capture_output=True,
-            timeout=90,
-        )
-    except Exception as exc:
-        log.debug("TTS sync error: %s", exc)
+    """Blocking TTS — used in wake word loop."""
+    if not _speak_via_server(text):
+        try:
+            subprocess.run([sys.executable, _TTS_WORKER],
+                           input=text.encode("utf-8", errors="replace"),
+                           capture_output=True, timeout=90)
+        except Exception as exc:
+            log.debug("TTS sync fallback error: %s", exc)
 
 
 # ── Persistent transcription server ──────────────────────────────────────────
@@ -454,11 +550,25 @@ def handle_text(user_message: str, history: list, mode: str):
     if not user_message.strip():
         yield history, "", core_markup(False)
         return
+
     history = _append_user(history, user_message)
+    # Add empty assistant placeholder with streaming cursor
+    history = history + [{"role": "assistant", "content": "▌"}]
     yield history, "", core_markup(False)
-    response = _run_async(orchestrator.process(user_message))
-    history = _append_bot(history, response)
-    _speak_async(response)          # ← automatic voice output (non-blocking)
+
+    full_text = ""
+    try:
+        for token in _stream_llm(user_message):
+            full_text += token
+            history[-1]["content"] = full_text + "▌"
+            yield history, "", core_markup(False)
+    except Exception as exc:
+        log.error("handle_text stream error: %s", exc, exc_info=True)
+        full_text = f"[Error: {exc}]"
+
+    history[-1]["content"] = full_text
+    if full_text and not full_text.startswith("[Error"):
+        _speak_async(full_text)
     yield history, "", core_markup(True)
 
 
@@ -472,15 +582,18 @@ def handle_voice_capture(history: list, mode: str, muted: bool,
     Total latency: ~2-5 s instead of 40-55 s.
     """
     if mode != "Voice":
-        return history, "Voice mode is disabled.", core_markup(False)
+        yield history, "Voice mode is disabled.", core_markup(False)
+        return
     if muted:
         history = _append_exchange(history, "🔇 [muted]", "Microphone muted. Unmute to speak.")
-        return history, "Muted.", core_markup(False)
+        yield history, "Muted.", core_markup(False)
+        return
 
     worker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "voice", "voice_worker.py")
     if not os.path.exists(worker):
-        return history, "⚠ voice_worker.py not found.", core_markup(False)
+        yield history, "⚠ voice_worker.py not found.", core_markup(False)
+        return
 
     # Build record-only subprocess command (no --lang needed here)
     cmd = [sys.executable, worker, "--silence", "1.0"]
@@ -490,39 +603,58 @@ def handle_voice_capture(history: list, mode: str, muted: bool,
 
     try:
         # ── Step 1: record audio (fast, ~1-3 s) ─────────────────────────────
+        yield history, "⏺ Recording...", core_markup(False)
         log.info("Recording: %s", " ".join(str(c) for c in cmd))
         rec = subprocess.run(cmd, capture_output=True, timeout=60)
 
         if rec.returncode != 0:
             err = rec.stderr.decode("utf-8", errors="replace").strip() or "recorder error"
             log.error("voice_worker error: %s", err)
-            return history, f"Recording error: {err}", core_markup(False)
+            yield history, f"Recording error: {err}", core_markup(False)
+            return
 
         wav_path = rec.stdout.decode("utf-8", errors="replace").strip()
         if not wav_path or not os.path.exists(wav_path):
-            return history, "Nothing heard (no audio file).", core_markup(False)
+            yield history, "Nothing heard (no audio file).", core_markup(False)
+            return
 
         # ── Step 2: transcribe via persistent server (~1-2 s on GPU) ────────
+        yield history, "🔍 Transcribing...", core_markup(False)
         lang_arg = None if lang_choice in (None, "auto", "") else lang_choice
         log.info("Transcribing %s lang=%s ...", wav_path, lang_arg)
         transcript, _ = transcribe_audio_file(wav_path, lang_arg)
-        # wav_path deleted by server after transcription
         log.info("Transcript: %r", transcript)
 
         if not transcript.strip():
-            return history, "Nothing heard.", core_markup(False)
+            yield history, "Nothing heard.", core_markup(False)
+            return
 
-        history  = _append_user(history, f"🎤 {transcript}")
-        response = _run_async(orchestrator.process(transcript))
-        history  = _append_bot(history, response)
-        _speak_async(response)
-        return history, "✅ Done.", core_markup(True)
+        history = _append_user(history, f"🎤 {transcript}")
+        # Streaming assistant reply
+        history = history + [{"role": "assistant", "content": "▌"}]
+        yield history, "💭 Generating...", core_markup(False)
+
+        full_text = ""
+        try:
+            for token in _stream_llm(transcript):
+                full_text += token
+                history[-1]["content"] = full_text + "▌"
+                yield history, "💭 Generating...", core_markup(False)
+        except Exception as exc:
+            log.error("voice stream error: %s", exc)
+            full_text = f"[Error: {exc}]"
+
+        history[-1]["content"] = full_text
+        if full_text and not full_text.startswith("[Error"):
+            _speak_async(full_text)
+        yield history, "✅ Done.", core_markup(True)
+        return
 
     except subprocess.TimeoutExpired:
-        return history, "⚠ Voice recording timed out.", core_markup(False)
+        yield history, "⚠ Voice recording timed out.", core_markup(False)
     except Exception as exc:
         log.error("handle_voice_capture error: %s", exc, exc_info=True)
-        return history, f"Voice error: {exc}", core_markup(False)
+        yield history, f"Voice error: {exc}", core_markup(False)
 
 
 def clear_chat():
@@ -833,8 +965,9 @@ LANG_CHOICES = ["auto", "ru", "en"]
 LANG_DEFAULT = "auto"
 WAKE_LANG    = "auto"   # updated by UI language selector
 
-# Pre-warm transcription server in background
+# Pre-warm transcription server and TTS server in background
 _preload_transcription_server()
+_preload_tts_server()
 CHAT_HEIGHT = 150
 
 PORT = 7860

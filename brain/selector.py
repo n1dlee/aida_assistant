@@ -5,6 +5,7 @@ Routing logic based on task complexity, context length, and config thresholds.
 """
 import logging
 import os
+import time
 from typing import Tuple, List, Dict
 
 from brain.local_llm import LocalLLM
@@ -30,6 +31,17 @@ class ModelSelector:
     def __init__(self):
         self.local = LocalLLM()
         self.cloud = CloudLLM()
+        self._avail_cache: dict[str, tuple[bool, float]] = {}
+        self._avail_ttl = 10.0   # seconds between availability checks
+
+    def _is_available_cached(self, provider, name: str) -> bool:
+        now = time.monotonic()
+        cached = self._avail_cache.get(name)
+        if cached and now - cached[1] < self._avail_ttl:
+            return cached[0]
+        result = provider.is_available()
+        self._avail_cache[name] = (result, now)
+        return result
 
     def _complexity_score(self, user_input: str, history: List[Dict]) -> float:
         """Returns 0.0 (simple) → 1.0 (complex)."""
@@ -81,7 +93,7 @@ class ModelSelector:
 
         errors = []
         for name, provider in providers:
-            if not provider.is_available():
+            if not self._is_available_cached(provider, name):
                 log.debug("%s provider is not available.", name)
                 continue
             try:
@@ -101,3 +113,36 @@ class ModelSelector:
             )
 
         return "Sorry, no AI model is currently available. Please check your config.", "none"
+
+    async def stream_complete(
+        self,
+        system: str,
+        history: List[Dict],
+        user_input: str,
+        intent: str = "conversation",
+    ):
+        """Async generator: yields tokens, preferring local unless complex."""
+        use_cloud = self._should_use_cloud(user_input, history, intent)
+        pairs = [("cloud", self.cloud), ("local", self.local)] if use_cloud                 else [("local", self.local), ("cloud", self.cloud)]
+
+        for name, provider in pairs:
+            if not self._is_available_cached(provider, name):
+                continue
+            if not hasattr(provider, "stream_complete"):
+                # Non-streaming fallback
+                try:
+                    resp = await provider.complete(system, history, user_input)
+                    yield resp
+                    return
+                except Exception as exc:
+                    log.warning("%s non-stream failed: %s", name, exc)
+                    continue
+            try:
+                async for tok in provider.stream_complete(system, history, user_input):
+                    yield tok
+                return
+            except Exception as exc:
+                log.warning("%s stream failed: %s", name, exc)
+
+        yield "Sorry, no AI model is available."
+

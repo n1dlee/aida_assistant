@@ -42,17 +42,95 @@ def _is_safe_path(path: str) -> bool:
         return False
 
 
-def _extract_path(text: str) -> Optional[str]:
-    """Pull the most likely file/folder path from a natural-language string."""
-    # Match quoted paths first
-    m = re.search(r'["\']([^"\']+)["\']', text)
+# ── Russian disk-letter mapping ──────────────────────────────────────────────
+_RU_DISK = {
+    "а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ж":"j","з":"z",
+    "и":"i","к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r",
+    "с":"s","т":"t","у":"u","ф":"f","х":"h","ц":"c","э":"e","ю":"u",
+}
+
+_RE_QUOTED      = re.compile(r"""['"]([^'"]+)['"]""")
+_RE_BARE_PATH   = re.compile(r"([A-Za-z]):\\([\w\\. \-]+)")
+_RE_DISK_LETTER = re.compile(r"\b(?:disk|drive|диск[еа]?)\s+([A-Za-zА-Яа-я])", re.IGNORECASE)
+_RE_ON_DRIVE    = re.compile(r"\bon\s+([A-Za-z])(?::|(?=\s|$))", re.IGNORECASE)
+_RE_FOLDER_NAME = re.compile(
+    r"\b(?:named|called|name(?:\s+it)?|с\s+именем|назови(?:\s+его)?|имя)\s+"
+    r"[\"']?([A-Za-zА-Яа-я0-9][^\s,\"']*(?:\s+[A-Za-zА-Яа-я0-9][^\s,\"']*){0,4}?)[\"']?"
+    r"(?:\s+(?:on|in|at|на|в)\b|[,.]|$)",
+    re.IGNORECASE,
+)
+_RE_FOLDER_NOUN = re.compile(
+    r"\b(?:folder|directory|папку?|директорию)\s+[\"']?([A-Za-zА-Яа-я0-9][^\s,\"']{0,40})[\"']?"
+    r"(?:\s+(?:on|in|at|called|named|на|в)\b|$)",
+    re.IGNORECASE,
+)
+_RE_IN_PATH     = re.compile(r"\bin\s+[\"']?([A-Za-z]:\\[\w\\ .\-]+)[\"']?", re.IGNORECASE)
+
+
+def _parse_natural_path(text: str) -> Optional[str]:
+    """
+    Extract a Windows path from natural-language descriptions.
+    Examples:
+      "create folder Test on disk D"           → D:\\Test
+      "make a folder D:\\Projects\\New"         → D:\\Projects\\New
+      "создай папку Проект на диске Д"          → D:\\Проект
+      "create folder named Reports in C:\\Work" → C:\\Work\\Reports
+      "the folder on D called backup"           → D:\\backup
+    """
+    t = text.strip()
+
+    # 1. Quoted path wins
+    m = _RE_QUOTED.search(t)
     if m:
         return m.group(1).strip()
-    # Match something that looks like a path (contains / or \ or .)
-    m = re.search(r'([A-Za-z]:\\[\w\\. -]+|/[\w/. -]+|[\w][\w/\\. -]{3,})', text)
-    if m:
-        return m.group(1).strip()
+
+    # 2. Bare Windows path — only return immediately if no "name/called/named" keyword
+    m = _RE_BARE_PATH.search(t)
+    if m and not re.search(r"\b(?:named|called|name\s+it|с\s+именем|назови)\b", t, re.IGNORECASE):
+        return m.group(0)
+    # If there IS a name keyword, keep the bare path as parent and continue
+
+    # 3. Disk letter
+    disk_letter: Optional[str] = None
+    dm = _RE_DISK_LETTER.search(t)
+    if not dm:
+        dm = _RE_ON_DRIVE.search(t)
+    if not dm:  # bare "D:" anywhere
+        dm = re.search(r"\b([A-Za-z]):[/\\]", t, re.IGNORECASE)
+    if dm:
+        letter = dm.group(1).lower()
+        disk_letter = (_RU_DISK.get(letter, letter)).upper()
+
+    # 4. Folder name
+    nm = _RE_FOLDER_NAME.search(t)
+    if not nm:
+        nm = _RE_FOLDER_NOUN.search(t)
+    folder_name = nm.group(1).strip() if nm else None
+
+    # 5. Parent path
+    pm = _RE_IN_PATH.search(t)
+    parent_path = pm.group(1).strip() if pm else None
+
+    # Build path
+    if parent_path and folder_name:
+        sep = "\\" if "\\" in parent_path else "/"
+        return parent_path.rstrip("/\\") + sep + folder_name
+    if parent_path:
+        return parent_path
+    if disk_letter and folder_name:
+        return disk_letter + ":\\" + folder_name
+    if disk_letter:
+        return disk_letter + ":\\"
+    if folder_name:
+        return folder_name
+
     return None
+
+
+def _extract_path(text: str) -> Optional[str]:
+    """Alias kept for backward compat."""
+    return _parse_natural_path(text)
+
 
 
 class FilesystemTool(BaseTool):
@@ -97,7 +175,7 @@ class FilesystemTool(BaseTool):
     # ── operations ────────────────────────────────────────────────────────────
 
     def _create_dir(self, text: str) -> str:
-        path = _extract_path(text)
+        path = _parse_natural_path(text)
         if not path:
             return "❌ Please specify the folder path to create."
         if not _is_safe_path(path):
@@ -109,7 +187,7 @@ class FilesystemTool(BaseTool):
             return f"❌ Could not create folder: {e}"
 
     def _delete(self, text: str) -> str:
-        path = _extract_path(text)
+        path = _parse_natural_path(text)
         if not path:
             return "❌ Please specify the path to delete."
         if not _is_safe_path(path):

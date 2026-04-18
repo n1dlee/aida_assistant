@@ -108,5 +108,33 @@ class Orchestrator:
             metadata={"response": response[:200]},
         )
 
+
+    async def stream_process(self, user_input: str):
+        """Async generator: yields LLM tokens for streaming UI display."""
+        intent = self.router.classify(user_input)
+        log.info("Intent (stream): %s", intent)
+
+        # Tools answer instantly — no streaming needed
+        if intent == "tool_call":
+            result = await self.tools.execute(user_input, llm_response="")
+            if result:
+                self._update_memory(user_input, result)
+                yield result
+                return
+
+        memories     = self.vector_store.search(user_input, top_k=3, role="user")
+        history      = self.buffer.get_history()
+        system_prompt = self.personality.build_system_prompt(memories=memories)
+
+        full_response = ""
+        model_used    = "unknown"
+        async for tok in self.selector.stream_complete(
+            system_prompt, history, user_input, intent
+        ):
+            full_response += tok
+            yield tok
+
+        log.info("Stream complete, %d chars", len(full_response))
+        self._update_memory(user_input, full_response)
     def stop(self):
         self._running = False

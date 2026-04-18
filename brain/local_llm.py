@@ -91,3 +91,49 @@ class LocalLLM:
             return response.message.content
 
         return await asyncio.get_running_loop().run_in_executor(None, _sync_call)
+
+    async def stream_complete(
+        self, system: str, history: list, user_input: str
+    ):
+        """Async generator — yields string tokens as they stream from Ollama."""
+        import asyncio, queue as _q
+
+        messages = [{"role": "system", "content": system}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": user_input})
+
+        client  = self._get_client()
+        q: "_q.Queue[object]" = _q.Queue()
+        _DONE   = object()
+
+        def _stream_thread():
+            try:
+                for chunk in client.chat(
+                    model=self.model_name,
+                    messages=messages,
+                    stream=True,
+                    options={"temperature": 0.7, "num_ctx": 4096},
+                ):
+                    tok = chunk.message.content or ""
+                    if tok:
+                        q.put(tok)
+            except Exception as exc:
+                q.put(exc)
+            finally:
+                q.put(_DONE)
+
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _stream_thread)
+
+        while True:
+            try:
+                item = q.get_nowait()
+            except _q.Empty:
+                await asyncio.sleep(0.008)
+                continue
+            if item is _DONE:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield str(item)
+
