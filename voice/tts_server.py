@@ -31,6 +31,15 @@ def _get_device():
 
 def _load_silero(language: str, speaker_id: str, device):
     import torch
+    # Try installing omegaconf if missing (required by Silero)
+    try:
+        import omegaconf  # noqa: F401
+    except ImportError:
+        import subprocess
+        print("[tts_server] Installing omegaconf...", file=sys.stderr, flush=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "omegaconf", "-q"],
+                       capture_output=True)
+
     print(f"[tts_server] Loading Silero {language}/{speaker_id} on {device} ...",
           file=sys.stderr, flush=True)
     model, _ = torch.hub.load(

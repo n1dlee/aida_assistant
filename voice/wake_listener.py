@@ -2,6 +2,7 @@
 voice/wake_listener.py
 ──────────────────────
 Long-running subprocess: continuously detects wake words and records commands.
+Loads WhisperModel ONCE directly (no sub-subprocess transcription_server).
 
 Architecture:
   Primary:  OpenWakeWord (fast, ~1ms/frame, no hallucinations)
@@ -10,12 +11,11 @@ Architecture:
 stdout:  {"transcript": "...", "lang": "en"}
 stderr:  progress / debug
 """
-
 import argparse, json, os, sys, tempfile
 import numpy as np
 
 SAMPLE_RATE      = 16_000
-CHUNK_SAMPLES    = 1_280           # 80 ms — OWW standard frame
+CHUNK_SAMPLES    = 1_280
 WAKE_CHUNK_SECS  = 2.5
 SILENCE_TIMEOUT  = float(os.getenv("AIDA_SILENCE_TIMEOUT",  "1.0"))
 ENERGY_THRESHOLD = float(os.getenv("AIDA_ENERGY_THRESHOLD", "0.015"))
@@ -29,7 +29,6 @@ WAKE_KEYWORDS = [
     "assistant","ассистент",
     "helper","помощник",
 ]
-
 HALLUCINATIONS = frozenset({
     "","."," ","...","you","i","a","the",
     "thank you","thank you.","thanks","thanks.",
@@ -77,84 +76,40 @@ def _save_wav(audio):
     fd,p=tempfile.mkstemp(suffix=".wav"); os.close(fd)
     sf.write(p,audio,SAMPLE_RATE); return p
 
-# ── Transcription via sub-subprocess ─────────────────────────────────────────
-# wake_listener spawns its own transcription_server so the Whisper model
-# stays loaded for the entire wake word session (not reloaded each command).
-
-_TRANS_PROC = None
-_TRANS_LOCK = __import__("threading").Lock()
-
-
-def _get_trans_server():
-    global _TRANS_PROC
-    if _TRANS_PROC and _TRANS_PROC.poll() is None:
-        return _TRANS_PROC
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "transcription_server.py")
-    if not os.path.exists(script):
-        raise RuntimeError("transcription_server.py not found next to wake_listener.py")
-    print("[wake_listener] Starting transcription_server sub-process ...",
-          file=sys.stderr, flush=True)
-    _TRANS_PROC = __import__("subprocess").Popen(
-        [__import__("sys").executable, script],
-        stdin=__import__("subprocess").PIPE,
-        stdout=__import__("subprocess").PIPE,
-        stderr=__import__("subprocess").PIPE,
-        bufsize=0,
-    )
-    import threading, queue as _queue
-    rq = _queue.Queue()
-    def _r(): rq.put(_TRANS_PROC.stdout.readline())
-    threading.Thread(target=_r, daemon=True).start()
-    # drain stderr
-    def _e():
-        for l in _TRANS_PROC.stderr:
-            print(f"[trans-srv] {l.decode(errors='replace').rstrip()}", file=sys.stderr)
-    threading.Thread(target=_e, daemon=True).start()
-    line = rq.get(timeout=120)
-    if b"READY" not in line:
-        raise RuntimeError(f"transcription_server failed: {line!r}")
-    print("[wake_listener] Transcription server READY.", file=sys.stderr, flush=True)
-    return _TRANS_PROC
-
-
-def _transcribe_file(path, language=None):
-    import json as _json
-    with _TRANS_LOCK:
-        proc = _get_trans_server()
-        req  = _json.dumps({"path": path, "lang": language or "auto"}) + "\n"
-        proc.stdin.write(req.encode()); proc.stdin.flush()
-        resp = _json.loads(proc.stdout.readline().decode().strip())
-        return resp.get("text",""), resp.get("lang","en")
-
-
-# Keep _load_whisper / _transcribe as aliases for OWW path that needs them
+# ── Load Whisper ONCE at startup ──────────────────────────────────────────────
 def _load_whisper():
-    # Model is loaded inside transcription_server sub-process now.
-    # This function just ensures the server is alive.
-    _get_trans_server()
-    return None   # no local model object needed
+    from faster_whisper import WhisperModel
+    dev=_gpu()
+    print(f"[wake_listener] Loading Whisper {WHISPER_MODEL} on {dev}...",
+          file=sys.stderr,flush=True)
+    for ct in (["float16","int8"] if dev=="cuda" else ["int8","float32"]):
+        try:
+            m=WhisperModel(WHISPER_MODEL,device=dev,compute_type=ct)
+            print(f"[wake_listener] Whisper ready ({dev}/{ct})",file=sys.stderr,flush=True)
+            return m
+        except Exception as e: print(f"[wake_listener] {ct} fail: {e}",file=sys.stderr)
+    raise RuntimeError("Cannot load WhisperModel")
 
-def _transcribe(model, path, language=None):
-    return _transcribe_file(path, language)
+def _transcribe(model,path,language=None):
+    segs,info=model.transcribe(path,beam_size=5,language=language)
+    return " ".join(s.text for s in segs).strip(), info.language
 
 def _try_oww():
     try:
         from openwakeword.model import Model
         oww=Model(wakeword_models=["hey_jarvis"],enable_speex_noise_suppression=False)
-        print("[wake_listener] OpenWakeWord ready (hey_jarvis)",file=sys.stderr,flush=True)
+        print("[wake_listener] OpenWakeWord ready",file=sys.stderr,flush=True)
         return oww
     except ImportError:
         print("[wake_listener] openwakeword not installed → Whisper fallback",file=sys.stderr,flush=True)
     except Exception as e:
-        print(f"[wake_listener] OWW fail: {e} → Whisper fallback",file=sys.stderr,flush=True)
+        print(f"[wake_listener] OWW fail: {e}",file=sys.stderr,flush=True)
     return None
 
 def _emit(text,lang):
     print(json.dumps({"transcript":text,"lang":lang}),flush=True)
 
-def _handle_command(device,lang):
-    """Record command after wake word and transcribe it."""
+def _handle_command(whisper_model,device,lang):
     audio=_record_vad(device=device)
     if _rms(audio)<ENERGY_THRESHOLD*0.5:
         print("[wake_listener] command: silence",file=sys.stderr,flush=True); return
@@ -167,7 +122,7 @@ def _handle_command(device,lang):
         try: os.unlink(p)
         except: pass
 
-def _oww_loop(oww,_model_unused,device,lang):
+def _oww_loop(oww,whisper_model,device,lang):
     import sounddevice as sd
     print("[wake_listener] OWW streaming...",file=sys.stderr,flush=True)
     with sd.InputStream(samplerate=SAMPLE_RATE,channels=1,dtype="float32",device=device) as stream:
@@ -178,11 +133,11 @@ def _oww_loop(oww,_model_unused,device,lang):
             score=max(pred.values()) if pred else 0.0
             if score>=OWW_THRESHOLD:
                 word=max(pred,key=pred.get)
-                print(f"[wake_listener] 🔔 OWW {word} score={score:.2f}",file=sys.stderr,flush=True)
+                print(f"[wake_listener] OWW {word} score={score:.2f}",file=sys.stderr,flush=True)
                 oww.reset()
-                _handle_command(device,lang)
+                _handle_command(whisper_model,device,lang)
 
-def _whisper_loop(_model_unused,device,lang):
+def _whisper_loop(whisper_model,device,lang):
     n=int(WAKE_CHUNK_SECS*SAMPLE_RATE/CHUNK_SAMPLES)
     print("[wake_listener] Whisper-fallback streaming...",file=sys.stderr,flush=True)
     while True:
@@ -195,8 +150,8 @@ def _whisper_loop(_model_unused,device,lang):
             except: pass
         print(f"[wake_listener] heard: {text!r}",file=sys.stderr,flush=True)
         if _is_valid_wake(text):
-            print(f"[wake_listener] 🔔 Wake: {text!r}",file=sys.stderr,flush=True)
-            _handle_command(device,lang)
+            print(f"[wake_listener] Wake: {text!r}",file=sys.stderr,flush=True)
+            _handle_command(whisper_model,device,lang)
 
 def main():
     p=argparse.ArgumentParser()
@@ -210,8 +165,8 @@ def main():
         print(f"[wake_listener] FATAL: {e}",file=sys.stderr,flush=True); sys.exit(1)
     oww=_try_oww()
     try:
-        if oww: _oww_loop(oww,None,args.device,lang)
-        else:   _whisper_loop(None,args.device,lang)
+        if oww: _oww_loop(oww,whisper,args.device,lang)
+        else:   _whisper_loop(whisper,args.device,lang)
     except KeyboardInterrupt:
         print("[wake_listener] Stopped.",file=sys.stderr)
     except Exception as e:

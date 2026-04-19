@@ -6,43 +6,11 @@
     "metadata": {}
   },
   {
-    "timestamp": "2026-04-18T19:53:48.048289",
+    "timestamp": "2026-04-18T20:08:04.686302",
     "type": "exchange",
-    "content": "Hello Aida, how are you doing?",
+    "content": "Wait, how are you doing?",
     "metadata": {
-      "response": "Hello. I am functioning optimally, thank you for asking. How may I assist you today?"
-    }
-  },
-  {
-    "timestamp": "2026-04-18T19:54:22.335301",
-    "type": "exchange",
-    "content": "Can you please create a new folder named",
-    "metadata": {
-      "response": "✅ Folder created: named"
-    }
-  },
-  {
-    "timestamp": "2026-04-18T19:54:47.216346",
-    "type": "exchange",
-    "content": "and disk D.",
-    "metadata": {
-      "response": "✅ Folder created: and disk D on disk D."
-    }
-  },
-  {
-    "timestamp": "2026-04-18T19:55:46.508836",
-    "type": "exchange",
-    "content": "In my disk disk, can you create a folder name?",
-    "metadata": {
-      "response": "Please tell me what you would like to name the folder."
-    }
-  },
-  {
-    "timestamp": "2026-04-18T19:56:12.823550",
-    "type": "exchange",
-    "content": "Can you create folder named hello?",
-    "metadata": {
-      "response": "❌ Could not create folder: [WinError 123] Синтаксическая ошибка в имени файла, имени папки или метке тома: 'hello?'"
+      "response": "I'm functioning properly, thanks for asking. No issues to report. How about you?"
     }
   }
 ]

@@ -10,6 +10,7 @@ from typing import Tuple, List, Dict
 
 from brain.local_llm import LocalLLM
 from brain.cloud_llm import CloudLLM
+from brain.groq_llm  import GroqLLM
 
 log = logging.getLogger("aida.brain.selector")
 
@@ -31,6 +32,7 @@ class ModelSelector:
     def __init__(self):
         self.local = LocalLLM()
         self.cloud = CloudLLM()
+        self.groq  = GroqLLM()
         self._avail_cache: dict[str, tuple[bool, float]] = {}
         self._avail_ttl = 10.0   # seconds between availability checks
 
@@ -85,8 +87,10 @@ class ModelSelector:
         """
         use_cloud = self._should_use_cloud(user_input, history, intent)
 
-        providers = []
-        if use_cloud:
+        # Groq is the fastest (free cloud, ~600 tok/s) — prefer it for all queries.
+        if self._is_available_cached(self.groq, "groq"):
+            providers = [("groq", self.groq), ("cloud", self.cloud), ("local", self.local)]
+        elif use_cloud:
             providers = [("cloud", self.cloud), ("local", self.local)]
         else:
             providers = [("local", self.local), ("cloud", self.cloud)]
@@ -123,7 +127,12 @@ class ModelSelector:
     ):
         """Async generator: yields tokens, preferring local unless complex."""
         use_cloud = self._should_use_cloud(user_input, history, intent)
-        pairs = [("cloud", self.cloud), ("local", self.local)] if use_cloud                 else [("local", self.local), ("cloud", self.cloud)]
+        if self._is_available_cached(self.groq, "groq"):
+            pairs = [("groq", self.groq), ("cloud", self.cloud), ("local", self.local)]
+        elif use_cloud:
+            pairs = [("cloud", self.cloud), ("local", self.local)]
+        else:
+            pairs = [("local", self.local), ("cloud", self.cloud)]
 
         for name, provider in pairs:
             if not self._is_available_cached(provider, name):
