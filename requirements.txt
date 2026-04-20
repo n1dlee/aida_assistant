@@ -1,46 +1,48 @@
 # AIDA — Python dependencies
 # Install: pip install -r requirements.txt
 
-# --- Core ---
+# ── Core ──────────────────────────────────────────────────────────────────────
 pyyaml>=6.0
 python-dotenv>=1.0
 
-# --- LLM: Local ---
+# ── LLM: Local ───────────────────────────────────────────────────────────────
 ollama>=0.2.0
 
-# --- LLM: Cloud ---
-google-generativeai>=0.5.0
+# ── LLM: Cloud ───────────────────────────────────────────────────────────────
+# Groq (free, ~600 tok/s) — set GROQ_API_KEY env var
+# Gemini — set GEMINI_API_KEY env var
 openai>=1.30.0
+google-generativeai>=0.5.0
 
-# --- Memory ---
+# ── Memory ───────────────────────────────────────────────────────────────────
 chromadb>=0.5.0
+onnxruntime>=1.16.0
 
-# --- Voice: STT ---
+# ── Voice: STT ───────────────────────────────────────────────────────────────
 faster-whisper>=1.0.0
 sounddevice>=0.4.6
 soundfile>=0.12.1
 
-# --- Voice: TTS ---
-pyttsx3>=2.90
+# ── Voice: TTS ───────────────────────────────────────────────────────────────
+gtts>=2.5.0               # primary TTS — Google TTS, good quality
+pydub>=0.25.1             # MP3 playback for gTTS (no external player needed)
+pyttsx3>=2.90             # offline fallback (SAPI5 on Windows)
+torch>=2.0.0              # required by Silero TTS and wake word
+omegaconf>=2.3.0          # required by Silero TTS
+edge-tts>=6.1.9           # optional: Microsoft neural TTS fallback
 
-# --- Voice: Wake word ---
-openwakeword>=0.6.0
+# ── Voice: Wake word ─────────────────────────────────────────────────────────
+openwakeword>=0.6.0       # fast wake word detection (~1ms/frame)
 
-# --- Tools ---
+# ── Tools ────────────────────────────────────────────────────────────────────
 duckduckgo-search>=6.0.0
 
-# --- Proactive scheduler ---
+# ── Scheduler ────────────────────────────────────────────────────────────────
 apscheduler>=3.10.0
 
-# --- Optional: numpy (required by voice modules) ---
+# ── Utilities ────────────────────────────────────────────────────────────────
 numpy>=1.24.0
 
-# --- Web server (for React UI) ---
-fastapi>=0.111.0
-uvicorn[standard]>=0.30.0
-
-# --- Gradio UI ---
-gradio>=4.40.0
-
-# --- ell (prompt versioning, optional) ---
-ell-ai>=0.0.15
+# ── UI ───────────────────────────────────────────────────────────────────────
+gradio>=6.0.0
+pywebview>=4.0.0
