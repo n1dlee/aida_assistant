@@ -1,32 +1,61 @@
 # AIDA Configuration
-# Edit this file to customize behaviour without touching Python code.
+# Edit this file to customise behaviour without touching Python code.
 
 aida:
   name: "AIDA"
   language: "auto"          # auto = detect from user input
   wake_word: "hey aida"
-  log_level: "INFO"
+  log_level: "DEBUG"
 
 brain:
-  local_model: "gemma4:31b"       # Ollama model name
-  cloud_provider: "gemini"           # "gemini" or "openai"
+  local_model: "gemma4:e2b"
+  cloud_provider: "gemini"
   cloud_model_gemini: "gemini-2.0-flash"
   cloud_model_openai: "gpt-4o-mini"
-  cloud_threshold: 0.4               # 0.0 = always local, 1.0 = always cloud
+  cloud_threshold: 0.4
   ollama_url: "http://localhost:11434"
 
 voice:
   enabled: true
-  whisper_model: "small"             # tiny | base | small | medium | large
-  tts_rate: 175                      # words per minute for pyttsx3
-  piper_voice: "en_US-lessac-medium"
+  tts_enabled: true
+  whisper_model: "small"
+  tts_rate: 175
   record_seconds: 5
 
 memory:
-  buffer_turns: 20                   # short-term: last N conversation turns
-  vector_top_k: 3                    # how many memories to inject into context
+  buffer_turns: 20
+  vector_top_k: 3
   chroma_path: "data/chroma_db"
   episodes_path: "data/episodes.json"
+  long_term_enabled: true
+  episodic_enabled: true
+
+modes:
+  enabled: true
+  default: "default"        # default | analytical | creative | coding | study | founder | focus
+
+planner:
+  enabled: true
+  goal_mode: true           # allow multi-step goal decomposition
+
+shadow:
+  enabled: false            # opt-in — privacy-sensitive, off by default
+
+predictive:
+  enabled: false            # opt-in — requires shadow data to be useful
+
+dual_brain:
+  enabled: true             # analytical + creative dual response mode
+
+logging:
+  action_log: true          # log tool calls + LLM calls for self-improvement
+  suggestion_log: true      # log suggestion acceptance/rejection
+
+ui:
+  plan_panel: true          # show plan steps in Brain panel
+  context_panel: true       # show active context in Brain panel
+  window_width: 430
+  window_height: 900
 
 proactive:
   enabled: true

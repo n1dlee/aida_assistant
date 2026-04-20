@@ -1,236 +1,220 @@
-# AIDA – AI Desktop Assistant
+# AIDA — AI Desktop Assistant
 
-AIDA is a modular AI assistant designed to run locally or in hybrid mode, combining multiple LLM providers, memory systems, voice interaction, and tool execution.
-
-It supports CLI, web interface (FastAPI + React), and an advanced Gradio UI with voice capabilities.
+Personal Jarvis-style AI assistant. Hybrid local + cloud LLM, voice I/O, memory, tools, proactive triggers.
 
 ---
 
-## Overview
+## Quick Start
 
-AIDA is built around a central orchestration system that:
+### 1. Install Python dependencies
+```bash
+pip install -r requirements.txt
+```
 
-- routes user intent
-- retrieves relevant memory
-- optionally executes tools
-- selects an appropriate LLM provider
-- generates responses
-- stores interaction history
+### 2. Configure environment
+```bash
+cp .env.example .env
+# Edit .env — add at least one API key (Gemini or OpenAI)
+```
 
----
+### 3. (Optional) Install Ollama for local LLM
+Download from https://ollama.ai, then:
+```bash
+ollama pull llama3.1:8b
+```
 
-## Core Architecture
-
-### Orchestrator
-
-Main logic:
-core/orchestrator.py
-
-Flow:
-
-1. Detect intent using IntentRouter  
-2. Attempt direct tool execution  
-3. Retrieve memory from vector store  
-4. Build system prompt (personality + memory)  
-5. Select LLM provider  
-6. Generate response  
-7. Store interaction  
-
----
-
-## Model Selection
-
-brain/selector.py
-
-### Providers
-
-- Local LLM (Ollama)
-- Cloud LLM (Gemini / OpenAI)
-- Groq (OpenAI-compatible)
-
-### Routing Priority
-
-1. Groq (if available)
-2. Cloud (complex queries)
-3. Local (simple queries)
-
-Automatic fallback if provider fails.
-
----
-
-## Memory System
-
-memory/
-
-### Components
-
-- buffer.py → short-term memory  
-- vector_store.py → long-term memory (ChromaDB or keyword fallback)  
-- episodic.py → logs to data/episodes.json  
-
----
-
-## Tools System
-
-tools/
-
-### Available Tools
-
-- System Tool → opens apps (notepad, browser, terminal)
-- Web Tool → DuckDuckGo search
-- Calendar Tool → local JSON (data/calendar.json)
-- Time Tool → system time
-- Filesystem Tool → file operations
-
-Filesystem supports:
-- read/write files
-- create/delete folders
-- rename
-- list directories
-
-Includes protection for system directories.
-
----
-
-## Voice System
-
-voice/
-
-### Features
-
-- microphone input
-- Whisper transcription
-- TTS (pyttsx3 / Piper)
-- wake word (OpenWakeWord)
-- transcription server
-- TTS server
-
-### Important
-
-Two separate pipelines:
-
-1. React UI → browser speech recognition  
-2. Gradio UI → local Whisper + TTS  
-
----
-
-## Interfaces
-
-### CLI
-
+### 4. Run AIDA
+```bash
 python main.py
+```
 
----
-
-### Web (FastAPI + React)
-
-Backend:
-server.py
-
-Endpoints:
-- /ws
-- /api/status
-- /api/history
-- DELETE /api/history
-
-Frontend:
-frontend/
-
----
-
-### Gradio UI
-
-python ui.py
-
-Features:
-- streaming responses
-- voice input/output
-- wake word
-- persistent models
-- chat history
-
----
-
-## Configuration
-
-### YAML
-
-config/settings.yaml  
-config/prompts.yaml  
-
-### Environment Variables
-
-Primary config is handled via env variables:
-
-- AIDA_LOCAL_MODEL  
-- AIDA_CLOUD_THRESHOLD  
-- WHISPER_MODEL  
-- AIDA_WAKE_WORD  
-- AIDA_TTS_RATE  
-- PIPER_VOICE  
-
----
-
-## Proactive System (Experimental)
-
-proactive/
-
-Contains:
-- scheduler
-- trigger engine
-
-Not fully integrated.
+AIDA starts in **text mode** by default (no mic required).  
+Type your messages, press Enter. Type `quit` to exit.
 
 ---
 
 ## Project Structure
 
-aida_assistant/
-├── brain/
+```
+aida/
+├── main.py                  # Entry point
 ├── core/
+│   ├── orchestrator.py      # Central coordinator
+│   ├── router.py            # Intent classifier
+│   └── personality.py       # System prompt builder
+├── brain/
+│   ├── selector.py          # Local vs cloud routing logic
+│   ├── local_llm.py         # Ollama wrapper
+│   └── cloud_llm.py         # Gemini / OpenAI wrapper
 ├── memory/
+│   ├── buffer.py            # Short-term conversation buffer
+│   ├── vector_store.py      # Long-term semantic memory (ChromaDB)
+│   └── episodic.py          # Timestamped event log
 ├── tools/
+│   ├── base_tool.py         # Abstract base class for tools
+│   ├── registry.py          # Auto-discovers and dispatches tools
+│   ├── system_tool.py       # Open apps / OS commands
+│   ├── web_tool.py          # DuckDuckGo web search
+│   ├── calendar_tool.py     # Local calendar (JSON)
+│   └── time_tool.py         # Current date/time
 ├── voice/
+│   ├── listener.py          # Microphone → Whisper STT
+│   ├── wake_word.py         # "Hey AIDA" detection
+│   └── speaker.py           # TTS output (pyttsx3 / Piper)
 ├── proactive/
+│   ├── scheduler.py         # APScheduler wrapper
+│   └── trigger_engine.py    # Condition-based proactive messages
 ├── config/
-├── data/
-├── frontend/
-├── main.py
-├── server.py
-├── ui.py
+│   ├── settings.yaml        # All configuration (no code changes needed)
+│   └── prompts.yaml         # AIDA personality & system prompt
+└── data/
+    ├── chroma_db/           # Persistent vector memory (auto-created)
+    └── episodes.json        # Episodic event log (auto-created)
+```
 
 ---
 
-## Key Files
+## Brain Routing Logic
 
-- core/orchestrator.py  
-- brain/selector.py  
-- memory/vector_store.py  
-- tools/registry.py  
-- ui.py  
-- server.py  
-- tools/filesystem_tool.py  
+```
+User input
+    │
+    ▼
+complexity_score()
+    │
+    ├── score < 0.4  ──▶  Ollama (local) ──▶ response
+    │
+    └── score ≥ 0.4  ──▶  Cloud API
+                              │
+                        fail? └──▶  Ollama fallback
+```
 
----
-
-## Limitations
-
-- tool routing is keyword-based  
-- config is split between YAML and env  
-- proactive system incomplete  
-- React and Gradio voice not unified  
-- memory retrieval is basic  
+Adjust `AIDA_CLOUD_THRESHOLD` in `.env` to tune this (0.0 = always local).
 
 ---
 
-## Summary
+## Adding a New Tool
 
-AIDA is a modular assistant framework with:
+1. Create `tools/my_tool.py`:
+```python
+from tools.base_tool import BaseTool
 
-- multi-model routing  
-- memory system  
-- tool execution  
-- voice interaction  
-- multiple interfaces  
+class MyTool(BaseTool):
+    @property
+    def name(self): return "my_tool"
 
-Suitable for experimentation and local AI workflows.
+    @property
+    def description(self): return "Does something useful."
+
+    async def run(self, query: str, **kwargs) -> str:
+        return f"Result for: {query}"
+```
+
+2. Register it in `tools/registry.py`:
+```python
+from tools.my_tool import MyTool
+# In _register_defaults():
+self.register(MyTool())
+```
+
+That's it.
+
+---
+
+## Enabling Voice Mode
+
+Install voice dependencies:
+```bash
+pip install faster-whisper sounddevice soundfile pyttsx3 openwakeword
+```
+
+Voice mode activates automatically when the packages are present.  
+Say **"Hey AIDA"** to activate, then speak your command.
+
+---
+
+## Customising Personality
+
+Edit `config/prompts.yaml` — change `system_prompt` to whatever character you want.  
+No Python changes needed.
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `GEMINI_API_KEY` | — | Gemini API key |
+| `OPENAI_API_KEY` | — | OpenAI API key |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
+| `AIDA_LOCAL_MODEL` | `llama3.1:8b` | Ollama model name |
+| `AIDA_CLOUD_THRESHOLD` | `0.4` | Complexity score to trigger cloud |
+| `WHISPER_MODEL` | `small` | Whisper model size |
+| `AIDA_WAKE_WORD` | `hey aida` | Wake word phrase |
+
+---
+
+## Web Interface (React)
+
+### Start the backend server
+```bash
+pip install fastapi uvicorn
+python server.py
+```
+
+### Start the React frontend (dev mode)
+```bash
+cd frontend
+npm install
+npm run dev
+```
+Open **http://localhost:5173** in your browser.
+
+### Build for production (optional)
+```bash
+cd frontend
+npm run build
+# Then just run: python server.py
+# Open http://localhost:8000
+```
+
+### Voice input
+Click the microphone button (🎤) and speak.
+Uses the browser's built-in Web Speech API — works in Chrome and Edge.
+For Russian, change `recog.current.lang = 'ru-RU'` in `frontend/src/hooks/useVoice.js`.
+
+---
+
+## Gradio Voice Interface (рекомендуется)
+
+Самый быстрый способ запустить голосовой интерфейс — только Python, никакого npm.
+
+### Установка
+```bash
+pip install gradio faster-whisper pyttsx3 ell-ai
+```
+
+### Запуск
+```bash
+python ui.py
+```
+Открой **http://localhost:7860**
+
+### Три режима
+| Режим | Ввод | Вывод |
+|---|---|---|
+| Text | Текст с клавиатуры | Текст в чате |
+| Voice | Микрофон (Whisper STT) | Голос (TTS) + текст |
+| Hybrid | Оба | Голос + текст |
+
+### Как пользоваться голосом
+1. Выбери режим **Voice** или **Hybrid**
+2. Нажми на микрофон → говори → отпусти
+3. Whisper транскрибирует → AIDA отвечает → pyttsx3 озвучивает
+
+### ell — версионирование промптов (опционально)
+Если установлен `ell-ai`, все промпты автоматически версионируются в `data/ell_store`.
+Запусти `ell studio` в отдельном терминале чтобы посмотреть историю:
+```bash
+ell studio --storage ./data/ell_store
+```

@@ -39,6 +39,7 @@ _early_log.getLogger("aida.ui").info("Gradio version: %s", gr.__version__)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.orchestrator import Orchestrator
 from voice.listener import VoiceListener
+from config.feature_flags import Flags
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -190,15 +191,24 @@ def get_microphones() -> list[str]:
 
 
 def get_status() -> str:
+    groq_ok  = orchestrator.selector.groq.is_available()
     local_ok = orchestrator.selector.local.is_available()
-    cloud_ok = orchestrator.selector.cloud.is_available()
     mem      = orchestrator.vector_store.count()
-    parts: list[str] = []
-    if local_ok:
-        parts.append(f"⬡ {orchestrator.selector.local.model_name}")
-    if cloud_ok:
-        parts.append(f"☁ {orchestrator.selector.cloud.model_name}")
+    mode     = orchestrator.modes.current
+    parts: list[str] = [f"{mode.emoji} {mode.label}"]
+    if groq_ok:
+        parts.append("⚡ Groq")
+    elif local_ok:
+        parts.append(f"⬡ Local")
+    else:
+        parts.append("⚠ No LLM")
+    active_skills = orchestrator.skills.active_skills
+    if active_skills:
+        parts.append(" ".join(s.emoji for s in active_skills))
     parts.append(f"🧠 {mem}")
+    goal_status = orchestrator.goal_engine.status()
+    if goal_status:
+        parts.append(goal_status[:40])
     return "  ·  ".join(parts) if parts else "⚠ No model"
 
 
@@ -664,10 +674,9 @@ def clear_chat():
 
 def toggle_voice_ui(m: str):
     show = m == "Voice"
-    chat_h = 150 if show else 320
     return (
-        gr.update(visible=show),                       # voice_group
-        gr.update(height=chat_h, min_height=chat_h),  # chatbox
+        gr.update(visible=show),          # voice_group
+        gr.update(),                       # chatbox — no height change in wide layout
     )
 
 
@@ -706,260 +715,551 @@ def save_settings(gemini_key: str, openai_key: str):
     return get_status(), "✅ Settings saved."
 
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
+
+
+def handle_assistant_mode_change(label: str) -> str:
+    """Switch AIDA personality mode from UI."""
+    key = orchestrator.modes.from_label(label) or label.split()[-1].lower()
+    profile = orchestrator.modes.set_mode(key)
+    return get_status()
+
+
+def get_plan_display() -> str:
+    """Return current plan for brain panel."""
+    if not orchestrator.planner.has_active_plan:
+        return ""
+    return orchestrator.planner.current_plan.to_display()
+
+
+def get_suggestions_display() -> str:
+    """Return predictive suggestions as compact string."""
+    from config.feature_flags import Flags
+    if not Flags.PREDICTIVE_SUGGESTIONS:
+        return ""
+    sugs = orchestrator.get_suggestions()
+    if not sugs:
+        return ""
+    return "💡 " + "\n\n💡 ".join(s.text for s in sugs[:3])
+
+
+
+# ── CSS ───────────────────────────────────────────────────────────────────────
 
 CSS = """
-/* ── Reset / root ──────────────────────────────────────── */
-html, body {
-    overflow: hidden !important;
-    height: 100% !important;
-    margin: 0;
-    padding: 0;
-    background: #120c0c !important;
-    font-family: 'Inter', 'Segoe UI', sans-serif;
+@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@300;400;500;600&family=Share+Tech+Mono&family=DM+Sans:wght@300;400;500&display=swap');
+
+/* ── Reset ─────────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+    --bg-void:      #05080d;
+    --bg-base:      #080c12;
+    --bg-panel:     #0c1018;
+    --bg-surface:   #111827;
+    --bg-surface2:  #161f2e;
+    --bg-hover:     #1a2436;
+    --cyan:         #00e5ff;
+    --cyan-dim:     rgba(0,229,255,0.12);
+    --cyan-glow:    rgba(0,229,255,0.35);
+    --cyan-soft:    rgba(0,229,255,0.07);
+    --indigo:       #7c8fff;
+    --indigo-dim:   rgba(124,143,255,0.12);
+    --green:        #00ffaa;
+    --green-dim:    rgba(0,255,170,0.1);
+    --amber:        #ffcc00;
+    --red:          #ff4466;
+    --text-hi:      #e8f0f8;
+    --text-mid:     #8fa8c0;
+    --text-lo:      #3d5470;
+    --border:       rgba(0,229,255,0.08);
+    --border-mid:   rgba(0,229,255,0.18);
+    --border-hi:    rgba(0,229,255,0.4);
+    --radius-sm:    6px;
+    --radius-md:    10px;
+    --radius-lg:    16px;
+    --font-ui:      'DM Sans', system-ui, sans-serif;
+    --font-mono:    'Share Tech Mono', monospace;
+    --font-display: 'Rajdhani', sans-serif;
+    --shadow-panel: 0 0 0 1px var(--border), 0 8px 32px rgba(0,0,0,0.6);
 }
 
-.gradio-container {
-    max-width: 430px !important;
-    width: 430px !important;
-    min-height: 900px !important;
-    max-height: 900px !important;
-    overflow-x: hidden !important;
-    overflow-y: auto !important;
-    background: linear-gradient(180deg, #1a1010 0%, #0f0808 100%) !important;
-    margin: 0 !important;
-    padding: 0 10px !important;
-    box-sizing: border-box;
+html, body {
+    background: var(--bg-void) !important;
+    height: 100%;
+    overflow: hidden;
+    font-family: var(--font-ui);
 }
-.gradio-container::before {
+
+footer, .built-with, .svelte-1ed2p3z { display: none !important; }
+
+/* ── Container ──────────────────────────────────────────────────────────────── */
+.gradio-container {
+    max-width: 100% !important;
+    width: 100% !important;
+    min-height: 100vh !important;
+    background: var(--bg-void) !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    overflow: hidden !important;
+}
+.gradio-container > .main > .wrap { padding: 0 !important; gap: 0 !important; }
+
+/* ── Scanline overlay ───────────────────────────────────────────────────────── */
+body::after {
     content: "";
     position: fixed;
     inset: 0;
     pointer-events: none;
-    background-image: linear-gradient(#9bd9b208 1px, transparent 1px),
-                      linear-gradient(90deg, #9bd9b208 1px, transparent 1px);
-    background-size: 28px 28px;
-    mask-image: radial-gradient(circle at center, black 40%, transparent 95%);
+    background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,0.03) 2px,
+        rgba(0,0,0,0.03) 4px
+    );
+    z-index: 9999;
 }
 
-footer { display: none !important; }
-.built-with { display: none !important; }
-
-/* ── Header ─────────────────────────────────────────────── */
-.aida-header {
-    text-align: center;
-    padding: 14px 0 4px;
-    letter-spacing: 6px;
-    font-size: 1.45rem;
-    font-weight: 800;
-    color: #c87a7a;
-    text-shadow: 0 0 18px #c87a7a55;
+/* ── TOP BAR ────────────────────────────────────────────────────────────────── */
+.topbar {
+    height: 54px !important;
+    min-height: 54px !important;
+    max-height: 54px !important;
+    background: linear-gradient(90deg, var(--bg-panel) 0%, var(--bg-base) 50%, var(--bg-panel) 100%) !important;
+    border-bottom: 1px solid var(--border-mid) !important;
+    display: flex !important;
+    align-items: center !important;
+    padding: 0 20px !important;
+    gap: 0 !important;
 }
-.aida-sub {
-    text-align: center;
+.topbar > .wrap { display: flex; align-items: center; width: 100%; gap: 0 !important; padding: 0 !important; }
+
+/* ── TOP BAR HTML ───────────────────────────────────────────────────────────── */
+.topbar-html {
+    flex: 0 0 auto;
+}
+.aida-wordmark {
+    font-family: var(--font-display);
+    font-size: 1.5rem;
+    font-weight: 600;
+    letter-spacing: 8px;
+    color: var(--cyan);
+    text-shadow: 0 0 20px var(--cyan-glow), 0 0 40px rgba(0,229,255,0.15);
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    white-space: nowrap;
+}
+.aida-wordmark .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 10px var(--cyan), 0 0 20px var(--cyan-glow);
+    animation: pulse-dot 2.4s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; box-shadow: 0 0 10px var(--cyan), 0 0 20px var(--cyan-glow); }
+    50%       { opacity: 0.4; box-shadow: 0 0 4px var(--cyan); }
+}
+.aida-tagline {
+    font-family: var(--font-mono);
     font-size: 0.6rem;
-    letter-spacing: 3px;
-    color: #ffffff28;
-    margin-bottom: 6px;
+    color: var(--text-lo);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    display: block;
+    margin-top: 1px;
 }
 
-.jarvis-core {
-    display: flex;
-    justify-content: center;
-    margin: 8px 0 10px;
-}
-.jarvis-core-ring {
-    width: 160px;
-    height: 160px;
-    border-radius: 999px;
-    border: 1px solid #a44f4f6a;
-    background: radial-gradient(circle, #8f3a3a35 0%, #1a0d0d00 72%);
-    box-shadow: inset 0 0 24px #8f3a3a2b, 0 0 26px #00000055;
-    position: relative;
-}
-.jarvis-core-ring::before {
-    content: "";
-    position: absolute;
-    inset: 18px;
-    border-radius: 999px;
-    border: 1px dashed #b35a5a3d;
-}
-.jarvis-core-dot {
-    position: absolute;
-    inset: 58px;
-    border-radius: 999px;
-    background: radial-gradient(circle, #ffdede 0%, #d37474 52%, #d3747400 100%);
-}
-.core-active .jarvis-core-ring {
-    box-shadow: inset 0 0 34px #c24d4d5f, 0 0 34px #c24d4d57;
-}
-.core-active .jarvis-core-dot {
-    box-shadow: 0 0 22px #ff8f8f99;
-}
-
-/* ── Status bar ─────────────────────────────────────────── */
-.aida-status p {
-    text-align: center;
-    font-size: 0.65rem;
-    color: #c87a7a75;
-    letter-spacing: 1px;
+/* status in topbar */
+.topbar-status { flex: 1; }
+.topbar-status p {
+    text-align: center !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.65rem !important;
+    color: rgba(0,229,255,0.45) !important;
+    letter-spacing: 1.5px !important;
     margin: 0 !important;
-    padding: 2px 0 4px !important;
 }
 
-/* ── Chatbot ─────────────────────────────────────────────── */
+/* ── THREE-PANEL LAYOUT ─────────────────────────────────────────────────────── */
+.aida-layout > .wrap {
+    display: flex !important;
+    height: calc(100vh - 54px) !important;
+    overflow: hidden !important;
+    padding: 0 !important;
+    gap: 0 !important;
+    align-items: stretch !important;
+}
+
+/* ── LEFT PANEL ─────────────────────────────────────────────────────────────── */
+.panel-left {
+    width: 220px !important;
+    min-width: 220px !important;
+    max-width: 220px !important;
+    flex-shrink: 0 !important;
+    background: var(--bg-panel) !important;
+    border-right: 1px solid var(--border) !important;
+    display: flex !important;
+    flex-direction: column !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    padding: 14px 10px !important;
+    gap: 14px !important;
+}
+.panel-left > .wrap { display: flex; flex-direction: column; gap: 14px; padding: 0; }
+
+.panel-section-label {
+    font-family: var(--font-mono);
+    font-size: 0.55rem;
+    letter-spacing: 2.5px;
+    color: var(--text-lo);
+    text-transform: uppercase;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 2px;
+}
+
+/* Mode pills in left panel */
+.mode-pills .wrap { display: flex !important; flex-direction: column !important; gap: 3px !important; padding: 0 !important; }
+.mode-pills label {
+    width: 100% !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-sm) !important;
+    background: transparent !important;
+    padding: 5px 8px !important;
+    transition: all 0.15s ease !important;
+    cursor: pointer !important;
+}
+.mode-pills label:hover { background: var(--cyan-soft) !important; border-color: var(--border-mid) !important; }
+.mode-pills label.selected {
+    background: var(--cyan-dim) !important;
+    border-color: var(--border-hi) !important;
+    box-shadow: 0 0 12px var(--cyan-glow), inset 0 0 8px rgba(0,229,255,0.05) !important;
+}
+.mode-pills label span {
+    font-size: 0.7rem !important;
+    font-family: var(--font-ui) !important;
+    color: var(--text-mid) !important;
+    font-weight: 400 !important;
+    letter-spacing: 0.3px !important;
+}
+.mode-pills label.selected span { color: var(--cyan) !important; }
+
+/* Skill dropdown */
+.skill-drop select, .skill-drop .wrap-inner {
+    background: var(--bg-surface) !important;
+    border: 1px solid var(--border) !important;
+    color: var(--text-mid) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.68rem !important;
+    border-radius: var(--radius-sm) !important;
+    padding: 5px 8px !important;
+}
+.skill-drop label span { font-size: 0.6rem !important; color: var(--text-lo) !important; letter-spacing: 1px !important; }
+
+/* Suggestions area */
+.suggestions-area p, .suggestions-area span {
+    font-family: var(--font-ui) !important;
+    font-size: 0.68rem !important;
+    color: var(--text-mid) !important;
+    line-height: 1.5 !important;
+}
+
+/* Shadow checkbox */
+.shadow-toggle label { font-size: 0.68rem !important; color: var(--text-lo) !important; font-family: var(--font-mono) !important; }
+.shadow-toggle input[type=checkbox] { accent-color: var(--indigo) !important; }
+
+/* ── CENTER PANEL ────────────────────────────────────────────────────────────── */
+.panel-center {
+    flex: 1 !important;
+    min-width: 0 !important;
+    background: var(--bg-base) !important;
+    display: flex !important;
+    flex-direction: column !important;
+    overflow: hidden !important;
+    position: relative !important;
+}
+.panel-center > .wrap { display: flex; flex-direction: column; height: 100%; padding: 0; gap: 0; }
+
+/* Chat area */
 .aida-chat {
-    background: #1a171acc !important;
-    border: 1px solid #ffffff1e !important;
-    border-radius: 18px !important;
-    backdrop-filter: blur(10px);
-    box-shadow: inset 0 1px 0 #ffffff14, 0 8px 20px #00000038;
+    flex: 1 !important;
+    background: transparent !important;
+    border: none !important;
+    border-radius: 0 !important;
+    min-height: 0 !important;
+    overflow-y: auto !important;
+    padding: 12px 18px !important;
 }
-.aida-chat .message-bubble-border {
-    border-radius: 8px !important;
-}
+.aida-chat .message-wrap { gap: 10px !important; }
 .aida-chat [data-testid="user"] .bubble-wrap {
-    background: #c06c6c1f !important;
-    border: 1px solid #c06c6c44 !important;
-    color: #f5dbdb !important;
-    font-size: 0.82rem !important;
+    background: var(--bg-surface) !important;
+    border: 1px solid var(--border-mid) !important;
+    color: var(--text-hi) !important;
+    font-family: var(--font-ui) !important;
+    font-size: 0.84rem !important;
+    border-radius: var(--radius-md) !important;
+    padding: 10px 14px !important;
+    box-shadow: none !important;
 }
 .aida-chat [data-testid="bot"] .bubble-wrap {
-    background: #131a17 !important;
-    border: 1px solid #ffffff14 !important;
-    color: #d5dbd8 !important;
-    font-size: 0.82rem !important;
+    background: var(--bg-panel) !important;
+    border: 1px solid var(--border) !important;
+    color: #c8daea !important;
+    font-family: var(--font-ui) !important;
+    font-size: 0.84rem !important;
+    border-radius: var(--radius-md) !important;
+    padding: 10px 14px !important;
+    border-left: 2px solid rgba(0,229,255,0.3) !important;
 }
 
-/* ── Mode radio ─────────────────────────────────────────── */
-.aida-mode .wrap {
-    gap: 6px !important;
-    justify-content: center;
+/* Input area */
+.input-area {
+    background: var(--bg-panel) !important;
+    border-top: 1px solid var(--border) !important;
+    padding: 12px 16px !important;
+    flex-shrink: 0 !important;
 }
-.aida-mode label span {
-    font-size: 0.7rem !important;
-    letter-spacing: 1px;
-    color: #8892a4 !important;
-}
-.aida-mode label.selected span {
-    color: #c87a7a !important;
-}
-.aida-mode label {
-    border: 1px solid #c87a7a26 !important;
-    border-radius: 8px !important;
-    background: #0f171400 !important;
-    padding: 3px 12px !important;
-}
-.aida-mode label.selected {
-    border-color: #c87a7a66 !important;
-    background: #c87a7a1a !important;
-}
-
-/* ── Input row ──────────────────────────────────────────── */
+.input-area > .wrap { padding: 0 !important; gap: 8px !important; }
 .aida-input textarea {
-    background: #181315 !important;
-    border: 1px solid #c87a7a26 !important;
-    border-radius: 10px !important;
-    color: #e4d4d4 !important;
-    font-size: 0.82rem !important;
+    background: var(--bg-surface) !important;
+    border: 1px solid var(--border-mid) !important;
+    border-radius: var(--radius-md) !important;
+    color: var(--text-hi) !important;
+    font-family: var(--font-ui) !important;
+    font-size: 0.84rem !important;
     resize: none !important;
+    padding: 10px 14px !important;
+    min-height: 44px !important;
 }
 .aida-input textarea:focus {
-    border-color: #c87a7a55 !important;
-    box-shadow: 0 0 0 2px #c87a7a1f !important;
+    border-color: var(--border-hi) !important;
+    box-shadow: 0 0 0 2px var(--cyan-dim), 0 0 16px var(--cyan-soft) !important;
+    outline: none !important;
 }
-.aida-send button {
-    background: #2a1f22 !important;
-    border: 1px solid #c87a7a44 !important;
-    border-radius: 10px !important;
-    color: #f1c9c9 !important;
-    font-size: 0.75rem !important;
-    letter-spacing: 1px;
-    height: 42px !important;
+.aida-input textarea::placeholder { color: var(--text-lo) !important; }
+.send-btn button {
+    background: var(--cyan-dim) !important;
+    border: 1px solid var(--border-hi) !important;
+    border-radius: var(--radius-md) !important;
+    color: var(--cyan) !important;
+    font-size: 0.8rem !important;
+    font-family: var(--font-mono) !important;
+    height: 44px !important;
+    min-width: 52px !important;
+    letter-spacing: 1px !important;
+    transition: all 0.15s !important;
 }
-.aida-send button:hover {
-    background: #3a2a2e !important;
+.send-btn button:hover {
+    background: rgba(0,229,255,0.22) !important;
+    box-shadow: 0 0 16px var(--cyan-glow) !important;
 }
 
-/* ── Voice panel ────────────────────────────────────────── */
+/* Core orb (small, centered in chat header) */
+.core-orb-wrap { display: flex; justify-content: center; padding: 10px 0 4px; }
+.core-orb-outer {
+    width: 56px; height: 56px;
+    border-radius: 50%;
+    border: 1px solid rgba(0,229,255,0.2);
+    background: radial-gradient(circle, rgba(0,229,255,0.08) 0%, transparent 70%);
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+    box-shadow: 0 0 20px rgba(0,229,255,0.08);
+}
+.core-orb-outer::before {
+    content: "";
+    position: absolute; inset: 8px;
+    border-radius: 50%;
+    border: 1px dashed rgba(0,229,255,0.12);
+    animation: spin-ring 12s linear infinite;
+}
+@keyframes spin-ring { to { transform: rotate(360deg); } }
+.core-orb-inner {
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    background: radial-gradient(circle, #fff 0%, var(--cyan) 50%, transparent 100%);
+    box-shadow: 0 0 12px var(--cyan), 0 0 24px var(--cyan-glow);
+}
+.core-active .core-orb-outer { box-shadow: 0 0 30px var(--cyan-glow); border-color: rgba(0,229,255,0.5); }
+.core-active .core-orb-inner { box-shadow: 0 0 20px var(--cyan), 0 0 40px var(--cyan-glow); animation: throb 0.8s ease-in-out infinite alternate; }
+@keyframes throb { from { opacity: 0.7; } to { opacity: 1; } }
+
+/* ── RIGHT PANEL ─────────────────────────────────────────────────────────────── */
+.panel-right {
+    width: 240px !important;
+    min-width: 240px !important;
+    max-width: 240px !important;
+    flex-shrink: 0 !important;
+    background: var(--bg-panel) !important;
+    border-left: 1px solid var(--border) !important;
+    display: flex !important;
+    flex-direction: column !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    padding: 14px 10px !important;
+    gap: 10px !important;
+}
+.panel-right > .wrap { display: flex; flex-direction: column; gap: 10px; padding: 0; }
+
+/* Input mode toggle (Text/Voice) */
+.input-mode .wrap { gap: 4px !important; justify-content: center !important; }
+.input-mode label {
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-sm) !important;
+    background: transparent !important;
+    padding: 4px 16px !important;
+    flex: 1 !important;
+    text-align: center !important;
+    transition: all 0.15s !important;
+}
+.input-mode label:hover { background: var(--cyan-soft) !important; }
+.input-mode label.selected { background: var(--indigo-dim) !important; border-color: rgba(124,143,255,0.5) !important; }
+.input-mode label span { font-size: 0.7rem !important; color: var(--text-mid) !important; letter-spacing: 0.5px !important; }
+.input-mode label.selected span { color: var(--indigo) !important; }
+
+/* Voice panel */
 .aida-voice-panel {
-    border: 1px solid #c87a7a25 !important;
-    border-radius: 10px !important;
-    padding: 6px 8px !important;
-    background: #151012 !important;
+    background: var(--bg-surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-md) !important;
+    padding: 10px !important;
 }
-.aida-voice-panel select, .aida-voice-panel .wrap-inner,
-.aida-settings input, .aida-settings select {
-    background: #1b1416 !important;
-    border: 1px solid #c87a7a26 !important;
-    color: #d9b7b7 !important;
-    font-size: 0.72rem !important;
-    border-radius: 8px !important;
-}
-
-/* ── Wake word button ───────────────────────────────────── */
-.wake-btn button {
-    width: 100% !important;
-    background: #1a1020 !important;
-    border: 1px solid #9b72dd66 !important;
-    border-radius: 8px !important;
-    color: #c4a8f5 !important;
-    font-size: 0.72rem !important;
-    letter-spacing: 1px;
-    padding: 5px 0 !important;
-}
-.wake-btn button:hover {
-    background: #231530 !important;
-}
-
-.aida-settings {
-    border: 1px solid #c87a7a25 !important;
-    border-radius: 10px !important;
-    background: #151012 !important;
-    box-shadow: inset 0 0 0 1px #c87a7a1a;
-}
-.aida-settings button {
-    border-radius: 8px !important;
-}
-.aida-settings-status textarea {
-    color: #c87a7a !important;
+.aida-voice-panel .markdown-body p { font-size: 0.65rem !important; color: var(--text-lo) !important; }
+.aida-voice-panel select, .aida-voice-panel .wrap-inner {
+    background: var(--bg-surface2) !important;
+    border: 1px solid var(--border) !important;
+    color: var(--text-mid) !important;
+    font-size: 0.68rem !important;
+    border-radius: var(--radius-sm) !important;
 }
 .aida-voice-panel button {
-    background: #2a1f22 !important;
-    border: 1px solid #c87a7a44 !important;
-    color: #f1c9c9 !important;
+    background: var(--bg-surface2) !important;
+    border: 1px solid var(--border-mid) !important;
+    border-radius: var(--radius-sm) !important;
+    color: var(--text-mid) !important;
+    font-size: 0.7rem !important;
+    transition: all 0.15s !important;
 }
-.aida-voice-panel button:hover {
-    background: #3a2a2e !important;
-}
+.aida-voice-panel button:hover { background: var(--indigo-dim) !important; border-color: rgba(124,143,255,0.4) !important; color: var(--indigo) !important; }
 
-/* ── Clear button ───────────────────────────────────────── */
+.wake-btn button {
+    width: 100% !important;
+    background: rgba(129,140,248,0.07) !important;
+    border: 1px solid rgba(129,140,248,0.3) !important;
+    color: var(--indigo) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.68rem !important;
+    letter-spacing: 1px !important;
+    border-radius: var(--radius-sm) !important;
+}
+.wake-btn button:hover { background: var(--indigo-dim) !important; }
+
+/* Talk button */
+.aida-voice-panel .gr-button:first-of-type,
+.talk-btn button {
+    background: rgba(0,255,170,0.07) !important;
+    border: 1px solid rgba(0,255,170,0.3) !important;
+    color: var(--green) !important;
+}
+.talk-btn button:hover { background: var(--green-dim) !important; box-shadow: 0 0 12px rgba(0,255,170,0.2) !important; }
+
+/* Plan display */
+.plan-area p, .plan-area span, .plan-area li {
+    font-family: var(--font-mono) !important;
+    font-size: 0.65rem !important;
+    color: var(--text-mid) !important;
+    line-height: 1.6 !important;
+}
+.plan-area strong { color: var(--cyan) !important; }
+
+/* Goal status */
+.goal-status textarea, .goal-status input {
+    background: var(--bg-surface) !important;
+    border: 1px solid var(--border) !important;
+    color: rgba(0,255,170,0.7) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.65rem !important;
+    border-radius: var(--radius-sm) !important;
+}
+.goal-status label span { font-size: 0.6rem !important; color: var(--text-lo) !important; }
+
+/* Settings accordion */
+.aida-settings {
+    background: var(--bg-surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-md) !important;
+}
+.aida-settings .label-wrap button { font-size: 0.7rem !important; color: var(--text-lo) !important; background: transparent !important; }
+.aida-settings input, .aida-settings select {
+    background: var(--bg-surface2) !important;
+    border: 1px solid var(--border) !important;
+    color: var(--text-mid) !important;
+    font-size: 0.7rem !important;
+    border-radius: var(--radius-sm) !important;
+}
+.aida-settings label span { font-size: 0.65rem !important; color: var(--text-lo) !important; }
+.aida-settings-brain {
+    background: var(--bg-surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius-md) !important;
+}
+.aida-settings-brain .label-wrap button { font-size: 0.7rem !important; color: var(--text-lo) !important; background: transparent !important; }
+.aida-settings-status textarea { color: rgba(0,255,170,0.7) !important; font-size: 0.68rem !important; }
+
+/* Clear button */
 .aida-clear button {
     width: 100% !important;
     background: transparent !important;
-    border: 1px solid #ffffff0a !important;
-    border-radius: 6px !important;
-    color: #ffffff28 !important;
-    font-size: 0.68rem !important;
-    letter-spacing: 1px;
-    padding: 4px 0 !important;
+    border: 1px solid rgba(255,68,102,0.15) !important;
+    color: rgba(255,68,102,0.4) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.6rem !important;
+    letter-spacing: 2px !important;
+    border-radius: var(--radius-sm) !important;
+    padding: 5px !important;
+    transition: all 0.15s !important;
 }
 .aida-clear button:hover {
-    border-color: #ff444428 !important;
-    color: #ff444488 !important;
+    border-color: rgba(255,68,102,0.5) !important;
+    color: rgba(255,68,102,0.8) !important;
+    background: rgba(255,68,102,0.05) !important;
 }
 
-/* Hide all Gradio labels we don't need */
-.aida-status label,
-.aida-voice-panel > .wrap > label:first-child,
-.hide-label label { display: none !important; }
+/* Voice status + misc textboxes */
+textarea[data-testid], .gr-textbox textarea {
+    background: var(--bg-surface2) !important;
+    border: 1px solid var(--border) !important;
+    color: var(--text-mid) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.68rem !important;
+    border-radius: var(--radius-sm) !important;
+}
+
+/* Lang radio inside voice panel */
+.aida-lang-radio .wrap { gap: 4px !important; }
+.aida-lang-radio label { padding: 2px 8px !important; border-radius: var(--radius-sm) !important; font-size: 0.65rem !important; }
+.aida-lang-radio label span { color: var(--text-lo) !important; font-size: 0.65rem !important; }
+.aida-lang-radio label.selected span { color: var(--indigo) !important; }
+.aida-lang-radio label.selected { background: var(--indigo-dim) !important; border-color: rgba(124,143,255,0.35) !important; }
+
+/* Hide Gradio labels on panels that don't need them */
+.panel-left label > span.svelte-1gfkn6j,
+.panel-right label > span.svelte-1gfkn6j { display: none !important; }
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-mid); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-hi); }
+
+/* ── Hide label on specific elements ─────────────────────────────────────────── */
+.hide-label label, .hide-label > div > label { display: none !important; }
 """
 
 
-# ── UI layout ─────────────────────────────────────────────────────────────────
-
-log.info("Querying microphones...")
-MIC_LIST   = get_microphones()
+# ── Runtime globals ───────────────────────────────────────────────────────────
+MIC_LIST     = get_microphones()
 log.info("Microphones: %s", MIC_LIST)
 LANG_CHOICES = ["auto", "ru", "en"]
 LANG_DEFAULT = "auto"
@@ -968,109 +1268,172 @@ WAKE_LANG    = "auto"   # updated by UI language selector
 # Pre-warm transcription server and TTS server in background
 _preload_transcription_server()
 _preload_tts_server()
-CHAT_HEIGHT = 150
 
-PORT = 7860
+CHAT_HEIGHT = 460
+PORT        = 7860
 
 log.info("Building Gradio UI (gr.Blocks)...")
 with gr.Blocks(title="AIDA", fill_width=True) as demo:
 
-    # ── Header ──────────────────────────────────────────────────────────────
-    gr.HTML("""
-    <div class="aida-header">◈ AIDA</div>
-    <div class="aida-sub">MINIMAL VOICE ASSISTANT</div>
-    """)
+    # ── TOP BAR ───────────────────────────────────────────────────────────────
+    with gr.Row(elem_classes=["topbar"]):
+        gr.HTML("""
+        <div class="topbar-html">
+            <span class="aida-wordmark">
+                <span class="dot"></span>AIDA
+            </span>
+            <span class="aida-tagline">AI DESKTOP ASSISTANT</span>
+        </div>
+        """)
+        status_md = gr.Markdown(get_status(),
+                                elem_classes=["topbar-status", "hide-label"])
 
-    # ── Status ───────────────────────────────────────────────────────────────
-    status_md = gr.Markdown(get_status(), elem_classes=["aida-status", "hide-label"])
+    # ── THREE-PANEL MAIN AREA ─────────────────────────────────────────────────
+    with gr.Row(elem_classes=["aida-layout"], equal_height=False):
 
-    # ── Mode ─────────────────────────────────────────────────────────────────
-    mode = gr.Radio(
-        choices=["Text", "Voice"],
-        value="Voice",
-        show_label=False,
-        container=False,
-        elem_classes=["aida-mode"],
-    )
+        # ══════════════════════════════════════════════════════════════════════
+        # LEFT PANEL — Context / Mode / Skill
+        # ══════════════════════════════════════════════════════════════════════
+        with gr.Column(scale=1, elem_classes=["panel-left"]):
 
-    core_view = gr.HTML(core_markup(False))
+            gr.HTML('<div class="panel-section-label">PERSONALITY</div>')
+            assistant_mode = gr.Radio(
+                choices    = orchestrator.modes.mode_labels(),
+                value      = orchestrator.modes.mode_labels()[0],
+                label      = "",
+                show_label = False,
+                container  = False,
+                elem_classes=["mode-pills"],
+            )
 
-    # ── Settings ─────────────────────────────────────────────────────────────
-    with gr.Accordion("⚙ Settings", open=False, elem_classes=["aida-settings"]):
-        gemini_key = gr.Textbox(
-            label="Gemini API Key",
-            type="password",
-            value=os.getenv("GEMINI_API_KEY", ""),
-            placeholder="AIza...",
-        )
-        openai_key = gr.Textbox(
-            label="OpenAI API Key",
-            type="password",
-            value=os.getenv("OPENAI_API_KEY", ""),
-            placeholder="sk-...",
-        )
-        save_settings_btn = gr.Button("Save settings", variant="secondary", size="sm")
-        settings_status = gr.Textbox(
-            label="", value="", interactive=False, lines=1,
-            elem_classes=["aida-settings-status"],
-        )
+            gr.HTML('<div class="panel-section-label" style="margin-top:6px">SKILL</div>')
+            skill_select = gr.Dropdown(
+                choices     = orchestrator.skills.skill_labels(),
+                value       = orchestrator.skills.skill_labels()[0],
+                label       = "",
+                show_label  = False,
+                interactive = True,
+                elem_classes= ["skill-drop"],
+            )
 
-    # ── Chat ─────────────────────────────────────────────────────────────────
-    chatbox = gr.Chatbot(
-        label="",
-        height=CHAT_HEIGHT,
-        min_height=CHAT_HEIGHT,
-        show_label=False,
-        elem_classes=["aida-chat"],
-        avatar_images=(None, None),
-    )
+            gr.HTML('<div class="panel-section-label" style="margin-top:6px">SUGGESTIONS</div>')
+            suggest_display = gr.Markdown("", elem_classes=["suggestions-area"])
 
-    # ── Input ────────────────────────────────────────────────────────────────
-    with gr.Row(equal_height=True) as text_row:
-        text_in = gr.Textbox(
-            placeholder="Message AIDA...",
-            show_label=False,
-            scale=8,
-            container=False,
-            elem_classes=["aida-input"],
-            lines=1,
-            max_lines=1,
-        )
-        send_btn = gr.Button("▶", scale=1, variant="secondary", size="sm",
-                             elem_classes=["aida-send"])
+            gr.HTML('<div class="panel-section-label" style="margin-top:6px">OBSERVE</div>')
+            shadow_chk = gr.Checkbox(
+                label="Shadow Mode",
+                value=False, interactive=True,
+                elem_classes=["shadow-toggle"],
+            )
+            gr.Markdown(
+                "<span style='font-size:0.55rem;color:#2a3a4a;line-height:1.4'>"
+                "Logs app patterns locally.<br>Never captures screen.</span>"
+            )
 
-    # ── Voice panel ───────────────────────────────────────────────────────────
-    with gr.Group(visible=True, elem_classes=["aida-voice-panel"]) as voice_group:
-        gr.Markdown("**Voice mode** — press TALK (VAD: auto-stops on silence).")
-        mic_device = gr.Dropdown(
-            choices=MIC_LIST,
-            value=MIC_LIST[0] if MIC_LIST else "Default microphone",
-            label="🎙 Microphone",
-            show_label=True,
-            interactive=True,
-            elem_classes=["aida-mic-select"],
-        )
-        lang_radio = gr.Radio(
-            choices=LANG_CHOICES, value=LANG_DEFAULT,
-            label="🌐 Language", interactive=True,
-            elem_classes=["aida-lang-radio"],
-        )
-        with gr.Row(equal_height=True):
-            talk_btn   = gr.Button("🎤 TALK", variant="secondary", size="sm")
-            mic_muted  = gr.Checkbox(label="Mute mic", value=False)
-        voice_state = gr.Textbox(label="Voice status", value="Idle",
-                                 interactive=False, lines=1)
+        # ══════════════════════════════════════════════════════════════════════
+        # CENTER PANEL — Main Interaction
+        # ══════════════════════════════════════════════════════════════════════
+        with gr.Column(scale=3, elem_classes=["panel-center"]):
 
-        gr.Markdown("**Wake Word mode** — say *'Aida'* to trigger automatically.")
-        wake_btn        = gr.Button("🔊 Wake Word ON", variant="secondary", size="sm",
-                                    elem_classes=["wake-btn"])
-        wake_status_txt = gr.Textbox(label="", value="Inactive",
-                                     interactive=False, lines=1,
-                                     elem_classes=["hide-label"])
+            core_view = gr.HTML(core_markup(False))
 
-    # ── Clear ────────────────────────────────────────────────────────────────
-    clear_btn = gr.Button("CLEAR CONVERSATION", variant="secondary", size="sm",
-                          elem_classes=["aida-clear"])
+            chatbox = gr.Chatbot(
+                label="",
+                height=CHAT_HEIGHT,
+                min_height=CHAT_HEIGHT,
+                show_label=False,
+                elem_classes=["aida-chat"],
+                avatar_images=(None, None),
+                autoscroll=False,
+            )
+
+            with gr.Row(equal_height=True, elem_classes=["input-area"]) as text_row:
+                text_in = gr.Textbox(
+                    placeholder="Message AIDA...",
+                    show_label=False,
+                    scale=9,
+                    container=False,
+                    elem_classes=["aida-input"],
+                    lines=1,
+                    max_lines=3,
+                )
+                send_btn = gr.Button("⏎", scale=1, variant="secondary",
+                                     size="sm", elem_classes=["send-btn"])
+
+        # ══════════════════════════════════════════════════════════════════════
+        # RIGHT PANEL — Tools / Plan / Voice / Settings
+        # ══════════════════════════════════════════════════════════════════════
+        with gr.Column(scale=1, elem_classes=["panel-right"]):
+
+            gr.HTML('<div class="panel-section-label">INPUT MODE</div>')
+            mode = gr.Radio(
+                choices=["Text", "Voice"],
+                value="Voice",
+                show_label=False,
+                container=False,
+                elem_classes=["input-mode"],
+            )
+
+            # ── Voice panel ──────────────────────────────────────────────────
+            with gr.Group(visible=True, elem_classes=["aida-voice-panel"]) as voice_group:
+                mic_device = gr.Dropdown(
+                    choices=MIC_LIST,
+                    value=MIC_LIST[0] if MIC_LIST else "Default microphone",
+                    label="🎙 Mic",
+                    show_label=True,
+                    interactive=True,
+                    elem_classes=["aida-mic-select"],
+                )
+                lang_radio = gr.Radio(
+                    choices=LANG_CHOICES, value=LANG_DEFAULT,
+                    label="🌐 Lang", interactive=True,
+                    elem_classes=["aida-lang-radio"],
+                )
+                with gr.Row(equal_height=True):
+                    talk_btn  = gr.Button("🎤 TALK", variant="secondary",
+                                          size="sm", elem_classes=["talk-btn"])
+                    mic_muted = gr.Checkbox(label="Mute", value=False)
+                voice_state = gr.Textbox(label="Status", value="Idle",
+                                         interactive=False, lines=1)
+                wake_btn = gr.Button("🔊 Wake ON", variant="secondary",
+                                     size="sm", elem_classes=["wake-btn"])
+                wake_status_txt = gr.Textbox(label="", value="",
+                                              interactive=False, lines=1,
+                                              elem_classes=["hide-label"])
+
+            # ── Plan / Goal ───────────────────────────────────────────────────
+            gr.HTML('<div class="panel-section-label" style="margin-top:4px">PLAN</div>')
+            plan_display = gr.Markdown("", elem_classes=["plan-area"])
+
+            with gr.Row():
+                goal_status_txt = gr.Textbox(
+                    label="Goal", value="", interactive=False,
+                    lines=1, placeholder="No active goal",
+                    elem_classes=["goal-status"],
+                )
+                abort_goal_btn = gr.Button("✗", size="sm", variant="secondary",
+                                           elem_classes=["aida-clear"])
+
+            # ── Settings ─────────────────────────────────────────────────────
+            with gr.Accordion("⚙ Config", open=False, elem_classes=["aida-settings"]):
+                gemini_key = gr.Textbox(
+                    label="Gemini Key", type="password",
+                    value=os.getenv("GEMINI_API_KEY", ""), placeholder="AIza...",
+                )
+                openai_key = gr.Textbox(
+                    label="OpenAI Key", type="password",
+                    value=os.getenv("OPENAI_API_KEY", ""), placeholder="sk-...",
+                )
+                save_settings_btn = gr.Button("Save", variant="secondary", size="sm")
+                settings_status = gr.Textbox(
+                    label="", value="", interactive=False, lines=1,
+                    elem_classes=["aida-settings-status"],
+                )
+
+            # ── Clear ─────────────────────────────────────────────────────────
+            clear_btn = gr.Button("CLEAR", variant="secondary",
+                                   size="sm", elem_classes=["aida-clear"])
+
 
     # ── Timer: polls WAKE_EVENTS every 500 ms ─────────────────────────────────
     timer = gr.Timer(0.5)
@@ -1123,6 +1486,39 @@ with gr.Blocks(title="AIDA", fill_width=True) as demo:
         outputs=[status_md, settings_status],
     )
 
+    assistant_mode.change(
+        fn=handle_assistant_mode_change,
+        inputs=[assistant_mode],
+        outputs=[status_md],
+    )
+
+    def _toggle_shadow(enabled: bool) -> None:
+        if enabled:
+            orchestrator.shadow.enable()
+        else:
+            orchestrator.shadow.disable()
+    shadow_chk.change(fn=_toggle_shadow, inputs=[shadow_chk], outputs=[])
+
+    def _change_skill(label: str) -> str:
+        key = orchestrator.skills.from_label(label)
+        if key:
+            orchestrator.skills.clear()
+            if key != "none":
+                orchestrator.skills.activate(key)
+        return get_status()
+    skill_select.change(fn=_change_skill, inputs=[skill_select], outputs=[status_md])
+
+    def _abort_goal() -> str:
+        msg = orchestrator.goal_engine.abort()
+        return msg
+    abort_goal_btn.click(fn=_abort_goal, outputs=[goal_status_txt])
+
+    # Refresh plan + suggestions + goal status every 2 s
+    plan_timer = gr.Timer(2.0)
+    plan_timer.tick(fn=get_plan_display,          outputs=[plan_display])
+    plan_timer.tick(fn=get_suggestions_display,    outputs=[suggest_display])
+    plan_timer.tick(fn=orchestrator.get_goal_status, outputs=[goal_status_txt])
+
 log.info("Gradio UI built successfully.")
 
 
@@ -1163,14 +1559,14 @@ if __name__ == "__main__":
         log.info("Waiting 2s for Gradio to bind to port %d...", PORT)
         time.sleep(2)
 
-        log.info("Opening native window 430×900 at http://127.0.0.1:%d", PORT)
+        log.info("Opening native window 1100×720 at http://127.0.0.1:%d", PORT)
         try:
             webview.create_window(
                 title="AIDA",
                 url=f"http://127.0.0.1:{PORT}",
-                width=430,
-                height=900,
-                resizable=False,
+                width=1100,
+                height=720,
+                resizable=True,
                 background_color="#0a0c0f",
             )
             log.info("webview.create_window() OK. Calling webview.start()...")
@@ -1185,8 +1581,7 @@ if __name__ == "__main__":
                 inbrowser=True,
                 show_error=True,
                 quiet=False,
-                css=CSS,
-            )
+                )
 
     except ImportError:
         log.warning("pywebview not installed — launching in browser instead.")
