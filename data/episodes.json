@@ -12,5 +12,29 @@
     "metadata": {
       "response": "I'm functioning properly, thanks for asking. No issues to report. How about you?"
     }
+  },
+  {
+    "timestamp": "2026-04-19T20:33:06.026612",
+    "type": "exchange",
+    "content": "How are you doing?",
+    "metadata": {
+      "response": "I'm functioning properly, ready to assist you. How can I help you today?"
+    }
+  },
+  {
+    "timestamp": "2026-04-19T20:35:27.538302",
+    "type": "exchange",
+    "content": "How are you doing?",
+    "metadata": {
+      "response": "I'm doing well, thanks for asking. I'm ready to help with any tasks or questions you may have. Is there something specific on your mind that you'd like to tackle?"
+    }
+  },
+  {
+    "timestamp": "2026-04-19T20:36:49.902271",
+    "type": "exchange",
+    "content": "How are you doing?",
+    "metadata": {
+      "response": "I'm functioning properly, ready to assist you. How can I help you today?"
+    }
   }
 ]
